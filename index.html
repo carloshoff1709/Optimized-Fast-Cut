@@ -1663,7 +1663,15 @@ document.addEventListener('click', e => {
    nuvem"), o app continua funcionando 100% local, exatamente como antes
    -- a nuvem é opcional e não quebra o uso sem login.
    ===================================================================== */
-function getGCfg(){ return lsGet('gcfg', { scriptUrl: '', userName: '' }); }
+// URL do Apps Script já publicado, embutida direto no app -- não depende de configuração manual
+// no painel "⚙" para funcionar. O painel continua existindo só para o caso de precisar apontar
+// para uma implantação diferente no futuro (uma config salva localmente tem prioridade sobre
+// esta constante).
+const DEFAULT_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxSZlpSr7-TCmpYGgeq0TmuIsorYjQR1n7XvdpDbsjqqXM1dpwb1xFxi_QLBoioWNI9ww/exec';
+function getGCfg(){
+  const raw = lsGet('gcfg', { scriptUrl: '', userName: '' });
+  return { scriptUrl: raw.scriptUrl || DEFAULT_SCRIPT_URL, userName: raw.userName || '' };
+}
 function setGCfg(c){ lsSet('gcfg', c); }
 const CLOUD = { authed: false, secret: null };
 function cloudConfigured(){ const c = getGCfg(); return !!c.scriptUrl; }
@@ -1766,10 +1774,10 @@ function cloudSignOut(){
 function openCloudCfg(){
   const c = getGCfg();
   openModal(`<div class="modal-h"><h2>Login e nuvem</h2><button class="icon-btn" data-cc="close" aria-label="Fechar">✕</button></div>
-    <p class="hint" style="margin:0 0 14px">Permite compartilhar os projetos com os colegas: uma senha única libera o acesso e um Google Apps Script (publicado a partir da sua Google Planilha) guarda os projetos. Deixe a URL em branco para manter o app 100% local, sem login.</p>
+    <p class="hint" style="margin:0 0 14px">Login e gravação na planilha são obrigatórios: uma senha única libera o acesso, e os projetos só são salvos direto na Google Planilha, via Apps Script. Mexa na URL abaixo só se precisar apontar para outra implantação do script -- deixar em branco volta a usar a implantação padrão do app, não desliga o login.</p>
     <div class="cfg-field f"><span>URL do Apps Script (Web App)</span><div class="inp"><input id="cfgScriptUrl" value="${esc(c.scriptUrl)}" placeholder="https://script.google.com/macros/s/.../exec"></div></div>
     <div class="cfg-field f"><span>Seu nome (aparece como quem salvou, opcional)</span><div class="inp"><input id="cfgUserName" value="${esc(c.userName || '')}" placeholder="ex.: Carlos"></div></div>
-    <p class="hint">Status: ${cloudSignedIn() ? 'conectado' : (cloudConfigured() ? 'configurado, não conectado' : 'nuvem desativada (uso local)')}</p>
+    <p class="hint">Status: ${cloudSignedIn() ? 'conectado' : 'não conectado'}</p>
     <div class="modal-actions">
       <button class="btn" data-cc="save">Salvar configuração</button>
       ${cloudSignedIn() ? '<button class="btn ghost" data-cc="signout">Sair</button>' : (cloudConfigured() ? '<button class="btn ghost" data-cc="signin">Entrar</button>' : '')}
@@ -1781,10 +1789,13 @@ document.addEventListener('click', e => {
   switch (b.dataset.cc){
     case 'close': closeModal(); break;
     case 'save': {
+      const prevUrl = getGCfg().scriptUrl;
       const scriptUrl = $('#cfgScriptUrl').value.trim(), userName = $('#cfgUserName').value.trim();
       setGCfg({ scriptUrl, userName });
+      const urlChanged = getGCfg().scriptUrl !== prevUrl;
+      if (urlChanged && cloudSignedIn()){ CLOUD.authed = false; CLOUD.secret = null; } // outra implantação -> exige logar de novo
       toast('Configuração salva.'); closeModal(); updateCloudChip();
-      if (scriptUrl && !cloudSignedIn()) showLoginGate(); else if (!scriptUrl) hideLoginGate();
+      if (!cloudSignedIn()) showLoginGate();
       break;
     }
     case 'signin': closeModal(); showLoginGate(); break;
@@ -1795,18 +1806,27 @@ document.addEventListener('click', e => {
 /* ---------- projetos (local ou na nuvem, conforme login) ---------- */
 function getProjects(){ return lsGet('projects', []); }
 async function saveProject(asNew){
+  // Salvar só é permitido direto na planilha (via Apps Script) -- não existe mais um modo local
+  // "de reserva": se não estiver autenticado, ou a chamada à planilha falhar, nada é salvo e o
+  // usuário é avisado, em vez de gravar uma cópia só no navegador dele sem ele perceber.
+  if (!cloudSignedIn()){
+    toast('Não é possível salvar: faça login novamente.');
+    showLoginGate();
+    return;
+  }
   const snap = JSON.parse(JSON.stringify(S)); snap.materialSnap = curMat() ? Object.assign({}, curMat()) : null;
   if (asNew || !S.id){ S.id = uid(); snap.id = S.id; }
   snap.updated = Date.now();
-  if (cloudSignedIn()){
-    try { await cloudSaveProject(snap); lsSet('draft', S); toast('Projeto salvo na nuvem: ' + S.name); return; }
-    catch (e){ toast('Falha ao salvar na nuvem (' + e.message + '). Salvando localmente.'); }
+  const btn = $('#btnSave'); if (btn){ btn.disabled = true; }
+  try {
+    await cloudSaveProject(snap);
+    S.id = snap.id;
+    toast('Projeto salvo na nuvem: ' + S.name);
+  } catch (e){
+    toast('Falha ao salvar na nuvem (' + e.message + '). Nada foi salvo -- tente de novo.');
+  } finally {
+    if (btn){ btn.disabled = false; }
   }
-  const list = getProjects();
-  const i = list.findIndex(p => p.id === S.id);
-  if (i >= 0) list[i] = snap; else list.push(snap);
-  if (!lsSet('projects', list)){ toast('Não foi possível salvar: o navegador bloqueou o armazenamento local.'); return; }
-  lsSet('draft', S); toast('Projeto salvo: ' + S.name);
 }
 function applyLoadedProject(p){
   const st = JSON.parse(JSON.stringify(p)); delete st.updated; delete st.updatedBy;
