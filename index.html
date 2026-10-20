@@ -1008,9 +1008,10 @@ let lsOk = true;
 function lsSet(k, v){ try { localStorage.setItem(NS + k, JSON.stringify(v)); return true; } catch (e){ lsOk = false; return false; } }
 
 let materials = lsGet('materials', null) || DEFAULT_MATERIALS.map(m => Object.assign({}, m));
-let S = lsGet('draft', null) || defaultState();
-S.params = Object.assign(defaultState().params, S.params || {});
-migrateWallStagger(S);
+// A cada acesso o app sempre abre em branco (projeto novo) -- nunca restaura automaticamente o
+// projeto que estava em edição na última vez. Para continuar um projeto, o usuário abre explicitamente
+// em "Projetos" -> "Abrir" (só o que foi salvo de verdade, com nome, fica disponível ali).
+let S = defaultState();
 normClad(S);
 let R = null;                 // resultado do último cálculo (camada ativa: OSB, ou o revestimento dentro de inLayer)
 let RC = null;                // resultado do revestimento (2ª camada) — null quando desligado
@@ -1030,11 +1031,9 @@ function inLayer(i, fn){
   }
 }
 const sfx = () => CUR_LAYER ? 'C' : '';
-let draftTimer = null;
 
 const curMat = () => materials.find(m => m.id === S.materialId) || null;
 const activeWall = () => S.walls.find(w => w.id === S.activeWall) || S.walls[0];
-function saveDraft(){ clearTimeout(draftTimer); draftTimer = setTimeout(() => { lsSet('draft', S); lsSet('materials', materials); }, 250); }
 function toast(msg){ const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('on'), 2600); }
 
 /* =====================================================================
@@ -1270,7 +1269,7 @@ document.addEventListener('change', e => {
     }
     else commitNumber(t, v => { P[k] = v; });
   }
-  saveDraft(); recalc();
+  recalc();
 });
 document.addEventListener('click', e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
@@ -1287,7 +1286,7 @@ document.addEventListener('click', e => {
     case 'materials': openMaterials(); return;
     default: return;
   }
-  saveDraft(); recalc();
+  recalc();
 });
 
 /* =====================================================================
@@ -1393,7 +1392,7 @@ document.addEventListener('click', e => {
   const tb = e.target.closest('[data-tab]'); if (tb){ const L = layerOf(tb); inLayer(L, () => { UI.tab = tb.dataset.tab; }); tb.parentElement.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t === tb)); renderPane(L); return; }
   const ap = e.target.closest('[data-apply]'); if (ap){
     const [o, st] = ap.dataset.apply.split('|'), P = layerOf(ap) ? S.clad.params : S.params; P.orientation = o; P.start = st;
-    renderInputs(); saveDraft(); recalc(); return;
+    renderInputs(); recalc(); return;
   }
   const wc = e.target.closest('[data-wallchip]'); if (wc){ const L = layerOf(wc); inLayer(L, () => { UI.wallId = wc.dataset.wallchip; }); renderPane(L); return; }
 });
@@ -1678,7 +1677,7 @@ document.addEventListener('click', e => {
     case 'reset': materials = DEFAULT_MATERIALS.map(m => Object.assign({}, m)); if (!curMat()) S.materialId = materials[0].id; break;
     default: return;
   }
-  lsSet('materials', materials); saveDraft(); fillMatRows(); renderInputs(); recalc();
+  lsSet('materials', materials); fillMatRows(); renderInputs(); recalc();
 });
 
 /* =====================================================================
@@ -1874,7 +1873,7 @@ function applyLoadedProject(p){
   st.walls.forEach(w => w.openings.forEach(o => { if (!(o.margin >= 0)) o.margin = 10; }));
   migrateWallStagger(st);
   S = st; if (!S.walls.length) S.walls = [newWall('P01', 3000, 3000)]; S.activeWall = S.walls[0].id; UI.wallId = S.activeWall;
-  syncAll(); saveDraft(); toast('Projeto aberto: ' + S.name);
+  syncAll(); toast('Projeto aberto: ' + S.name);
 }
 function loadProject(id){ const p = getProjects().find(x => x.id === id); if (!p) return; applyLoadedProject(p); }
 function duplicateProject(id){
@@ -1925,7 +1924,7 @@ document.addEventListener('click', async e => {
         catch (err){ toast('Erro ao excluir: ' + err.message); b.disabled = false; }
       } else { lsSet('projects', getProjects().filter(p => p.id !== id)); if (S.id === id) S.id = null; openProjects(); }
       break;
-    case 'new': { const keepUnit = S.unit; S = defaultState(); S.unit = keepUnit; S.materialId = materials[0].id; UI.wallId = S.activeWall; syncAll(); saveDraft(); closeModal(); toast('Novo projeto criado.'); break; }
+    case 'new': { const keepUnit = S.unit; S = defaultState(); S.unit = keepUnit; S.materialId = materials[0].id; UI.wallId = S.activeWall; syncAll(); closeModal(); toast('Novo projeto criado.'); break; }
     case 'saveas': await saveProject(true); openProjects(); break;
   }
 });
@@ -2975,7 +2974,7 @@ function buildPDF(){
 /* =====================================================================
    INICIALIZAÇÃO
    ===================================================================== */
-$('#projName').addEventListener('change', e => { S.name = e.target.value.trim() || 'Sem nome'; e.target.value = S.name; saveDraft(); });
+$('#projName').addEventListener('change', e => { S.name = e.target.value.trim() || 'Sem nome'; e.target.value = S.name; });
 $('#btnSave').addEventListener('click', () => { S.name = $('#projName').value.trim() || 'Sem nome'; saveProject(false); });
 $('#btnProjects').addEventListener('click', openProjects);
 $('#btnReport').addEventListener('click', openReport);
