@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
 :root{
   box-sizing:border-box;
@@ -781,7 +782,10 @@ function solve(S, mat, orient, start, effort){
   const sh = orient === 'standing' ? Lg : Sd;      // altura da chapa na parede
   const entries = [];
   for (const wall of S.walls){
-    const lay = calculateLayout(wall, sw, sh, P, start);
+    // desencontro mínimo das juntas é por parede -- sobrescreve só esse campo num clone raso de P,
+    // mantendo todo o resto (modulação, juntas, orientação etc.) igual pra todas as paredes
+    const wallP = Object.assign({}, P, { stagger: wall.stagger || 0 });
+    const lay = calculateLayout(wall, sw, sh, wallP, start);
     if (lay.error) return { error: `${wall.name}: ${lay.error}` };
     entries.push({ wall, lay });
   }
@@ -900,6 +904,7 @@ function validate(S, mat){
       else if (o.x + o.w > w.w + EPS || o.y + o.h > w.h + EPS) e.push(`${on}: a abertura ultrapassa os limites da parede (${mm(w.w)} × ${mm(w.h)} mm).`);
     });
     if (P.floorGap >= w.h) e.push(`${n}: a folga do piso (${mm(P.floorGap)} mm) é maior ou igual à altura da parede.`);
+    if (!isFinite(w.stagger) || w.stagger < 0) e.push(`${n}: desencontro mínimo das juntas inválido.`);
     for (let i = 0; i < w.openings.length; i++) for (let j = i + 1; j < w.openings.length; j++){
       const a = w.openings[i], b = w.openings[j];
       if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) e.push(`${n}: as aberturas "${a.name}" e "${b.name}" se sobrepõem.`);
@@ -909,7 +914,6 @@ function validate(S, mat){
   else if (!(mat.w > 0) || !(mat.h > 0)) e.push('A chapa precisa ter largura e altura maiores que zero.');
   ['gapV', 'gapH', 'kerf', 'tol', 'minRem', 'floorGap', 'cornerClear'].forEach(k => { if (!isFinite(P[k]) || P[k] < 0) e.push('Valor inválido em: ' + ({ gapV: 'junta vertical', gapH: 'junta horizontal', kerf: 'espessura da serra', tol: 'tolerância', minRem: 'sobra mínima', floorGap: 'folga do piso', cornerClear: 'distância da junta ao canto da abertura' })[k] + ' (use número ≥ 0).'); });
   if (!isFinite(P.studs) || P.studs < 0) e.push('Modulação dos montantes inválida.');
-  if (!isFinite(P.stagger) || P.stagger < 0) e.push('Desencontro mínimo inválido.');
   if (P.isClad && (!isFinite(P.layerOff) || P.layerOff < 0)) e.push('Distância mínima entre as juntas do revestimento e do OSB inválida (use número ≥ 0).');
   return e;
 }
@@ -967,7 +971,22 @@ const DEFAULT_MATERIALS = [
   { id: 'm-mdf15', name: 'MDF 15 mm', type: 'MDF', w: 1850, h: 2750, t: 15 }
 ];
 const MAT_TYPES = ['OSB', 'Placa cimentícia', 'Compensado', 'MDF', 'MDP', 'Drywall', 'Outro'];
-function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [] }; }
+// stagger/staggerCustom: desencontro mínimo das juntas -- é POR PAREDE (cada parede pode ter o seu
+// próprio valor, diferente das outras), ao contrário dos demais parâmetros de montagem (modulação,
+// juntas, orientação etc.), que continuam valendo pra todas as paredes do projeto.
+function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false }; }
+// Migração: antes o desencontro mínimo era um único valor do projeto (S.params.stagger), aplicado a
+// TODAS as paredes por igual -- o que forçava o mesmo valor em todas. Paredes salvas antes dessa
+// mudança não têm wall.stagger ainda; herdam o valor antigo do projeto uma única vez (preservando o
+// resultado já calculado), e dali em diante cada parede guarda o seu próprio valor, independente.
+function migrateWallStagger(st){
+  const legacy = (st.params && st.params.stagger > 0) ? st.params.stagger : 0;
+  const legacyCustom = !!(st.params && st.params.staggerCustom);
+  (st.walls || []).forEach(w => {
+    if (!(w.stagger >= 0)) w.stagger = legacy;
+    if (w.staggerCustom == null) w.staggerCustom = legacyCustom;
+  });
+}
 /* Revestimento (2ª camada sobre o OSB, ex.: gesso). Usa as mesmas paredes/aberturas; só os parâmetros de montagem são próprios. */
 function defaultClad(){
   return { on: false, materialId: 'm-dry125', params: { orientation: 'auto', start: 'left', gapV: 3, gapH: 3, floorGap: 10, stagger: 0, cornerClear: 200, layerOff: 200, layerH: false } };
@@ -979,7 +998,7 @@ function normClad(st){
 function defaultState(){
   const w = newWall('P01', 3000, 3000);
   return { id: null, name: 'Novo projeto', unit: 'mm', walls: [w], activeWall: w.id, materialId: 'm-apaplus',
-    params: { orientation: 'auto', start: 'left', studs: 0, studsCustom: false, gapV: 3, gapH: 3, floorGap: 10, cornerClear: 200, kerf: 3, stagger: 0, staggerCustom: false, tol: 0, minRem: 300, rotate: false, share: true, showStuds: true,
+    params: { orientation: 'auto', start: 'left', studs: 0, studsCustom: false, gapV: 3, gapH: 3, floorGap: 10, cornerClear: 200, kerf: 3, tol: 0, minRem: 300, rotate: false, share: true, showStuds: true,
       cncMachine: 'RHINO 3000S', cncPost: 'ABSOLUTE 3000 ATC (mm) (*.tap)', cncTool: 1, cncToolName: 'Topo raso 4mm', cncRpm: 18000, cncFeed: 3000, cncPlunge: 300, cncPasses: 3, cncOvercut: 1, cncSafeZ: 20, cncHomeZ: 20.32, cncTableX: 1900, cncTableY: 2800,
       cncEngrave: true, cncEngraveDepth: 1, cncEngraveFeed: 2500, cncEngraveHeight: 100 },
     clad: defaultClad() };
@@ -991,6 +1010,7 @@ function lsSet(k, v){ try { localStorage.setItem(NS + k, JSON.stringify(v)); ret
 let materials = lsGet('materials', null) || DEFAULT_MATERIALS.map(m => Object.assign({}, m));
 let S = lsGet('draft', null) || defaultState();
 S.params = Object.assign(defaultState().params, S.params || {});
+migrateWallStagger(S);
 normClad(S);
 let R = null;                 // resultado do último cálculo (camada ativa: OSB, ou o revestimento dentro de inLayer)
 let RC = null;                // resultado do revestimento (2ª camada) — null quando desligado
@@ -1029,14 +1049,14 @@ function staggerOptions(P){   // com montantes, o desencontro é sempre múltipl
   for (let k = 1; k * M <= maxD + 0.01 && k <= 6; k++) o.push(k * M);
   return o;
 }
-function snapStagger(P){
-  if (P.studs > 0 && P.stagger > 0){ const o = staggerOptions(P); if (o.length && !o.includes(P.stagger)){ P.stagger = o.reduce((b, v) => Math.abs(v - P.stagger) < Math.abs(b - P.stagger) ? v : b, o[0]); } P.staggerCustom = false; }
+// Ajusta o desencontro mínimo DESTA parede pro múltiplo mais próximo da modulação do projeto (P.studs,
+// que continua global), quando há montantes -- mesma regra de antes, só que por parede agora.
+function snapWallStagger(w, P){
+  if (P.studs > 0 && w.stagger > 0){ const o = staggerOptions(P); if (o.length && !o.includes(w.stagger)){ w.stagger = o.reduce((b, v) => Math.abs(v - w.stagger) < Math.abs(b - w.stagger) ? v : b, o[0]); } w.staggerCustom = false; }
 }
 function renderInputs(){
   const P = S.params, mat = curMat(), C = S.clad, CP = C.params, cm = materials.find(m => m.id === C.materialId) || null;
-  snapStagger(P);
   const studsMode = P.studsCustom ? 'custom' : ([0, 400, 600].includes(P.studs) ? String(P.studs) : 'custom');
-  const stagMode = P.staggerCustom ? 'custom' : ([0, 300, 400, 600].includes(P.stagger) ? String(P.stagger) : 'custom');
   $('#inputs').innerHTML = `
   <div class="card">
     <div class="card-h"><h2><span class="step">1</span>Paredes</h2>
@@ -1073,12 +1093,8 @@ function renderInputs(){
       ${lenField('Junta vertical (lado a lado)', P.gapV, 'data-p="gapV"', 'mm')}
       ${lenField('Junta horizontal (entre fiadas)', P.gapH, 'data-p="gapH"', 'mm')}
       ${lenField('Espessura de corte (serra ou diâmetro da fresa CNC)', P.kerf, 'data-p="kerf"', 'mm')}
-      <label class="f"><span>Desencontro mínimo das juntas</span><div class="inp"><select data-p="staggerMode" aria-label="Desencontro mínimo entre juntas">
-        ${P.studs > 0
-          ? `<option value="0" ${P.stagger > 0 ? '' : 'selected'}>Sem desencontro</option>` + staggerOptions(P).map((v, i) => `<option value="${v}" ${P.stagger === v ? 'selected' : ''}>${mm(v)} mm (${i + 1}x a modulação)</option>`).join('')
-          : `<option value="0" ${stagMode === '0' ? 'selected' : ''}>Sem desencontro</option><option value="300" ${stagMode === '300' ? 'selected' : ''}>300 mm</option><option value="400" ${stagMode === '400' ? 'selected' : ''}>400 mm</option><option value="600" ${stagMode === '600' ? 'selected' : ''}>600 mm</option><option value="custom" ${stagMode === 'custom' ? 'selected' : ''}>Personalizado</option>`}
-      </select></div></label>
     </div>
+    <p class="hint">Desencontro mínimo das juntas: configurado por parede, no card "Paredes" acima (abra a parede desejada).</p>
     <div class="grid2" style="margin-top:10px">
       ${lenField('Folga do piso (altura inicial)', P.floorGap, 'data-p="floorGap"', 'mm')}
       <p class="hint" style="margin:22px 0 0">A 1ª fiada começa nessa altura. Ex.: 10 mm para drywall e OSB.</p>
@@ -1088,7 +1104,6 @@ function renderInputs(){
       <p class="hint" style="margin:22px 0 0">Regra técnica: nenhuma junta a menos de 200 mm do canto de porta/janela; a chapa que contorna o canto é cortada inteira em L (ou U). Com 0 a distância deixa de ser exigida, mas as peças continuam inteiras em L/U.</p>
     </div>
     ${P.studs > 0 ? '<p class="hint">Com montantes, a chapa começa encostada na parede (pegando o montante inteiro) e a junta cai no eixo do montante. Chapas múltiplas da modulação (ex.: 2400 mm em módulos de 600) não são refiladas e a junta vertical não é descontada.</p>' : ''}
-    ${stagMode === 'custom' && !(P.studs > 0) ? `<div style="margin-top:10px">${lenField('Deslocamento mínimo entre juntas', P.stagger, 'data-p="stagger"', 'mm')}</div>` : ''}
     ${studsMode === 'custom' ? `<label class="check"><input type="checkbox" data-p="showStuds" ${P.showStuds ? 'checked' : ''}> Mostrar montantes no desenho</label>` : ''}
     <hr class="sep">
     <details class="adv"><summary>Ajustes avançados</summary>
@@ -1178,9 +1193,18 @@ function renderWallList(){
 function renderWallForm(){
   const el = $('#wallForm'); if (!el) return;
   const w = activeWall(); if (!w){ el.innerHTML = '<p class="empty">Adicione uma parede.</p>'; return; }
+  const P = S.params;
+  snapWallStagger(w, P);
+  const wStagMode = w.staggerCustom ? 'custom' : ([0, 300, 400, 600].includes(w.stagger) ? String(w.stagger) : 'custom');
   el.innerHTML = `
     <label class="f" style="margin-bottom:10px"><span>Nome da parede</span><div class="inp"><input type="text" data-wall="name" value="${esc(w.name)}"></div></label>
     <div class="grid2">${lenField('Largura da parede', w.w, 'data-wall="w"')}${lenField('Altura da parede', w.h, 'data-wall="h"')}</div>
+    <label class="f" style="margin-top:10px"><span>Desencontro mínimo das juntas (só desta parede)</span><div class="inp"><select data-wall="staggerMode" aria-label="Desencontro mínimo das juntas desta parede">
+      ${P.studs > 0
+        ? `<option value="0" ${w.stagger > 0 ? '' : 'selected'}>Sem desencontro</option>` + staggerOptions(P).map((v, i) => `<option value="${v}" ${w.stagger === v ? 'selected' : ''}>${mm(v)} mm (${i + 1}x a modulação)</option>`).join('')
+        : `<option value="0" ${wStagMode === '0' ? 'selected' : ''}>Sem desencontro</option><option value="300" ${wStagMode === '300' ? 'selected' : ''}>300 mm</option><option value="400" ${wStagMode === '400' ? 'selected' : ''}>400 mm</option><option value="600" ${wStagMode === '600' ? 'selected' : ''}>600 mm</option><option value="custom" ${wStagMode === 'custom' ? 'selected' : ''}>Personalizado</option>`}
+    </select></div></label>
+    ${wStagMode === 'custom' && !(P.studs > 0) ? `<div style="margin-top:10px">${lenField('Deslocamento mínimo entre juntas desta parede', w.stagger, 'data-wall="stagger"', 'mm')}</div>` : ''}
     <hr class="sep">
     <div class="card-h" style="margin-bottom:6px"><h3>Aberturas (portas e janelas)</h3><button class="btn ghost sm" data-act="addOp">+ Abertura</button></div>
     <div id="opList">${w.openings.length ? '' : '<p class="hint" style="margin:0">Nenhuma abertura. A posição Y é medida a partir do piso. O recuo é a distância entre a chapa e o vão osso (ex.: 10, 20, 30, 40 mm).</p>'}${w.openings.map(opRow).join('')}</div>`;
@@ -1207,6 +1231,11 @@ document.addEventListener('change', e => {
   if (t.dataset.unit != null){ S.unit = t.value; renderInputs(); }
   else if (t.dataset.wall){
     if (t.dataset.wall === 'name'){ w.name = t.value.trim() || 'Parede'; }
+    else if (t.dataset.wall === 'staggerMode'){
+      if (t.value === 'custom'){ w.staggerCustom = true; if (!(w.stagger > 0)) w.stagger = 500; }
+      else { w.staggerCustom = false; w.stagger = Number(t.value); }
+      renderWallForm();
+    }
     else commitNumber(t, v => { w[t.dataset.wall] = v; });
     renderWallList();
   } else if (t.dataset.op){
@@ -1227,7 +1256,6 @@ document.addEventListener('change', e => {
     const k = t.dataset.p, P = S.params;
     if (k === 'orientation' || k === 'start') P[k] = t.value;
     else if (k === 'studsMode'){ if (t.value === 'custom'){ P.studsCustom = true; if (!(P.studs > 0)) P.studs = 500; } else { P.studsCustom = false; P.studs = Number(t.value); } renderInputs(); }
-    else if (k === 'staggerMode'){ if (t.value === 'custom'){ P.staggerCustom = true; if (!(P.stagger > 0)) P.stagger = 500; } else { P.staggerCustom = false; P.stagger = Number(t.value); } renderInputs(); }
     else if (k === 'showStuds') P.showStuds = t.type === 'checkbox' ? t.checked : t.value === '1';
     else if (k === 'rotate' || k === 'share') P[k] = t.checked;
     else if (k === 'cncEngrave'){ P.cncEngrave = t.checked; renderInputs(); }
@@ -1321,9 +1349,16 @@ function resultsBlock(layer){
   if (R.mat.type === 'Placa cimentícia' && gaps.some(g => g < 6 || g > 10)) warn.push('Placa cimentícia: use juntas de dilatação de 6 a 10 mm (alta movimentação térmica).');
   const P = S.params;
   const better = R.bestAll && cmpKey(rankResult(R.bestAll.r), rankResult(r)) < 0 ? R.bestAll : null;
-  // desencontro entre fiadas realmente obtido (o valor pedido é um MÍNIMO; o resultado pode ser maior)
-  const stags = r.entries.map(e => e.lay.minStag).filter(v => isFinite(v)), stagMin = stags.length ? Math.min(...stags) : null;
-  const stagLine = P.stagger > 0 && stagMin != null ? `<br>Desencontro entre fiadas obtido: <b>${mm(stagMin)} mm</b> (mínimo pedido: ${mm(P.stagger)} mm${stagMin < P.stagger - 0.5 ? ' — não foi possível atingir nesta parede' : stagMin > P.stagger + 0.5 ? ' — a melhor opção que cumpre o mínimo' : ''}).` : '';
+  // desencontro entre fiadas realmente obtido (o valor pedido é um MÍNIMO, por parede; o resultado pode
+  // ser maior). Quando todas as paredes com desencontro pedem o mesmo valor, mostra como antes; quando
+  // divergem, não dá pra resumir num só número -- os avisos por parede abaixo (warn[]) já trazem o
+  // detalhe de cada uma, com o valor pedido correto de cada uma.
+  const stagEntries = r.entries.filter(e => (e.wall.stagger || 0) > 0 && isFinite(e.lay.minStag));
+  const stagVals = Array.from(new Set(stagEntries.map(e => e.wall.stagger)));
+  const stagLine = !stagEntries.length ? '' : stagVals.length === 1
+    ? (() => { const target = stagVals[0], got = Math.min(...stagEntries.map(e => e.lay.minStag));
+        return `<br>Desencontro entre fiadas obtido: <b>${mm(got)} mm</b> (mínimo pedido: ${mm(target)} mm${got < target - 0.5 ? ' — não foi possível atingir em alguma parede' : got > target + 0.5 ? ' — a melhor opção que cumpre o mínimo' : ''}).`; })()
+    : '<br>Desencontro mínimo das juntas: valor configurado por parede (varia entre as paredes deste projeto) — veja os avisos abaixo.';
   const layerLine = P.isClad && isFinite(m.minLayer) && P.layerOff > 0 ? `<br>Menor distância entre juntas do revestimento e do OSB: <b>${mm(m.minLayer)} mm</b> (mínimo pedido: ${mm(P.layerOff)} mm${m.minLayer < P.layerOff - 0.5 ? ' — não foi possível atingir nesta parede' : ''}).` : '';
   const why = better ? (better.r.metrics.cornerViol < m.cornerViol ? 'Outra combinação testada cumpre a regra dos cantos das aberturas' : better.r.metrics.layerShort < m.layerShort ? 'Outra combinação testada cumpre o desencontro em relação ao OSB' : better.r.metrics.staggerShort < m.staggerShort ? 'Outra combinação testada cumpre o desencontro mínimo pedido' : 'Outra combinação testada usa menos') : '';
   return `
@@ -1495,8 +1530,11 @@ function paneWall(){
 }
 function wallMetrics(ent){ return { whole: ent.lay.pieces.filter(p => p.whole).length, cut: ent.lay.pieces.filter(p => !p.whole).length }; }
 function panePlan(){
-  const r = R.sel.r;
-  return `<p class="hint" style="margin:0 0 10px">Cada chapa mostra as peças (verde-água), as sobras reaproveitáveis (verde), os resíduos (cinza) e os cortes em vermelho tracejado. O número da peça é o mesmo usado na vista da parede (chapa.peça).</p>
+  const r = R.sel.r, anyCuts = r.sheets.some(s => s.cutLines.length);
+  return `<div class="toolbar" style="margin:0 0 10px">
+      <p class="hint" style="margin:0">Cada chapa mostra as peças (verde-água), as sobras reaproveitáveis (verde), os resíduos (cinza) e os cortes em vermelho tracejado. O número da peça é o mesmo usado na vista da parede (chapa.peça).</p>
+      <button class="btn ghost sm" style="margin-left:auto;white-space:nowrap" data-act3="gcodeall" data-layer="${CUR_LAYER}" ${anyCuts ? '' : 'disabled'}>⬇ Baixar tudo (.zip)</button>
+    </div>
   <div class="sheet-grid">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>${legend()}`;
 }
 function sheetCard(s, r){
@@ -1834,6 +1872,7 @@ function applyLoadedProject(p){
   delete st.materialSnap;
   st.params = Object.assign(defaultState().params, st.params || {}); normClad(st);
   st.walls.forEach(w => w.openings.forEach(o => { if (!(o.margin >= 0)) o.margin = 10; }));
+  migrateWallStagger(st);
   S = st; if (!S.walls.length) S.walls = [newWall('P01', 3000, 3000)]; S.activeWall = S.walls[0].id; UI.wallId = S.activeWall;
   syncAll(); saveDraft(); toast('Projeto aberto: ' + S.name);
 }
@@ -1901,14 +1940,14 @@ function generateReport(){
   return `<div class="rep">
     <h1>${esc(S.name)}</h1><div class="meta">Relatório de paginação de chapas${P.isClad ? ' — REVESTIMENTO sobre o OSB' : ''} · ${date}</div>
     <h2>Dados do projeto</h2>
-    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th></tr></thead><tbody>
-      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td></tr>`).join('')}</tbody></table>
+    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Desenc. mín. juntas</th></tr></thead><tbody>
+      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td></tr>`).join('')}</tbody></table>
     <h2>Material e montagem</h2>
     <table><tbody>
       <tr><td>Chapa</td><td>${esc(R.mat.name)} (${esc(R.mat.type)}) · ${mm(R.mat.w)} × ${mm(R.mat.h)} mm · espessura ${fmtNum(R.mat.t, 1)} mm</td></tr>
       <tr><td>Sentido / início</td><td>${ORIENT_NAME[r.orient]} · início pela ${START_NAME[r.start].toLowerCase()}</td></tr>
       <tr><td>Juntas</td><td>${P.studs > 0 ? 'vertical no eixo do montante (não descontada)' : 'vertical ' + mm(P.gapV) + ' mm'} · horizontal ${mm(P.gapH)} mm · serra ${mm(P.kerf)} mm · folga do piso ${mm(P.floorGap || 0)} mm</td></tr>
-      <tr><td>Montantes</td><td>${P.studs > 0 ? 'a cada ' + mm(P.studs) + ' mm' : 'sem modulação'}${P.stagger > 0 ? ' · desencontro mínimo de juntas ' + mm(P.stagger) + ' mm' : ''}</td></tr></tbody></table>
+      <tr><td>Montantes</td><td>${P.studs > 0 ? 'a cada ' + mm(P.studs) + ' mm' : 'sem modulação'} · desencontro mínimo de juntas: por parede, veja a tabela acima</td></tr></tbody></table>
     <h2>Resultado</h2>
     <table><tbody>
       <tr><td>Chapas necessárias</td><td class="n"><b>${m.nSheets}</b> (${m.nWholeClean} inteiras sem corte, ${m.nSheets - m.nWholeClean} a cortar)</td><td>Área comprada</td><td class="n">${fmtA(m.nominal)}</td></tr>
@@ -2042,17 +2081,29 @@ const ENGRAVE_MARGIN = 6;
 // deslocamento local em X ANTES de devolver os pontos — assim, quando mpt() aplicar sua própria
 // troca de eixos lá fora, as duas inversões se cancelam e o resultado final é uma ROTAÇÃO (texto
 // gira com a peça, mas continua legível), em vez de um espelhamento.
+// Numa peça com recorte (formato L/U/moldura, contornando uma abertura — ver pl.body/pl.voids em
+// placePiece), a caixa cheia (pl.x,y,w,h) inclui a área VAZIA do vão, que é removida/descartada — não
+// é material de verdade. Gravar centralizado nessa caixa cheia, sem olhar pra isso, pode colocar a
+// gravação em cima do vazio (relatado pelo usuário: "as escritas estão em area de corte"). Por isso,
+// a gravação é centralizada no MAIOR retângulo de material maciço da peça (pl.body), não na caixa
+// inteira; numa peça comum, sem recorte, pl.body não existe e isto devolve a própria caixa cheia —
+// comportamento idêntico ao de antes.
+function engraveTargetRect(pl){
+  if (!pl.body || !pl.body.length) return { x: pl.x, y: pl.y, w: pl.w, h: pl.h };
+  return pl.body.reduce((best, r) => (!best || r.w * r.h > best.w * best.h) ? r : best, null);
+}
 function pieceEngraveCuts(pl, text, heightMM, mirrorFix){
   const raw = normalizeEngraveText(text);
   if (!raw) return [];
   const { origins, widthUnits } = glyphOrigins(raw);
   if (!origins.length || widthUnits <= 0) return [];
   const H = heightMM > 0 ? heightMM : 100;
-  const rotate = pl.h > pl.w;
-  const availW = (rotate ? pl.h : pl.w) - 2 * ENGRAVE_MARGIN, availH = (rotate ? pl.w : pl.h) - 2 * ENGRAVE_MARGIN;
+  const target = engraveTargetRect(pl);
+  const rotate = target.h > target.w;
+  const availW = (rotate ? target.h : target.w) - 2 * ENGRAVE_MARGIN, availH = (rotate ? target.w : target.h) - 2 * ENGRAVE_MARGIN;
   const s = H / FONT_GRID_H;
   if (availW <= 0 || availH <= 0 || H > availH || widthUnits * s > availW) return [];
-  const startX = -(widthUnits * s) / 2, cx = pl.x + pl.w / 2, cy = pl.y + pl.h / 2, paths = [];
+  const startX = -(widthUnits * s) / 2, cx = target.x + target.w / 2, cy = target.y + target.h / 2, paths = [];
   origins.forEach(({ ch, x }) => {
     glyphStrokes(ch).forEach(stroke => {
       const pts = stroke.map(([gx, gy]) => {
@@ -2403,6 +2454,37 @@ function exportGcodeL(sheetNo, pieceLabel){
     saveFile((S.name || 'projeto').replace(/[^\w\-]+/g, '_') + (CUR_LAYER ? '_revest' : '') + '_chapa' + sheetNo + '.txt', gc);
   }
 }
+// Baixar tudo de uma vez: gera o programa de cada chapa (igual ao botão individual, chapa inteira —
+// não peça a peça) e compacta num .zip com uma pasta de nome do projeto dentro, em vez de baixar
+// arquivo por arquivo. A parte sensível à camada (OSB x revestimento) roda toda dentro de inLayer,
+// de forma síncrona, e só devolve texto/strings já prontos -- o zip e o saveFile (assíncronos) rodam
+// depois, fora do inLayer, porque não dependem mais de R/S.params/CUR_LAYER.
+function exportAllGcode(layer){
+  const data = inLayer(layer || 0, exportAllGcodeCollect);
+  if (data) zipAndSaveGcode(data);
+}
+function exportAllGcodeCollect(){
+  if (!R){ toast('Corrija os dados antes de exportar.'); return null; }
+  const errs = validateCnc(S.params, R.mat);
+  if (errs.length){ toast('Corrija em "Programa de usinagem CNC": ' + errs[0] + '.'); return null; }
+  const sheets = R.sel.r.sheets.filter(s => s.cutLines.length);
+  if (!sheets.length){ toast('Nenhuma chapa tem corte a programar — só chapas inteiras, sem precisar programar a máquina.'); return null; }
+  const folder = (S.name || 'projeto').replace(/[^\w\-]+/g, '_') + (CUR_LAYER ? '_revest' : '');
+  const files = sheets.map(sheet => ({ name: folder + '_chapa' + sheet.no + '.txt', content: generateGcode(sheet, R.sel.r) }));
+  return { folder, files };
+}
+async function zipAndSaveGcode({ folder, files }){
+  if (typeof JSZip === 'undefined'){ toast('Não foi possível carregar o compactador de arquivos (.zip). Verifique a conexão e tente de novo.'); return; }
+  const zip = new JSZip(), sub = zip.folder(folder);
+  files.forEach(f => sub.file(f.name, f.content));
+  toast('Compactando ' + files.length + ' programa(s)...');
+  try {
+    const blob = await zip.generateAsync({ type: 'blob' });
+    await saveFile(folder + '.zip', blob);
+  } catch (e){
+    toast('Falha ao gerar o .zip (' + ((e && e.message) || e) + ').');
+  }
+}
 
 /* ---------- Simulação visual do programa de usinagem ---------- */
 // A simulação anima a MESMA lista de "strokes" usada para gravar o G-code (buildStrokes/sheetToolpath/
@@ -2711,6 +2793,7 @@ document.addEventListener('click', e => {
     const sheetNo = Number(g.dataset.sheet), sel = g.parentElement.querySelector(`[data-gcpiece="${sheetNo}"]`);
     exportGcode(sheetNo, sel && sel.value ? sel.value : null, Number(g.dataset.layer || 0));
   }
+  if (g && g.dataset.act3 === 'gcodeall') exportAllGcode(Number(g.dataset.layer || 0));
   if (g && g.dataset.act3 === 'sim'){
     const sheetNo = Number(g.dataset.sheet), sel = g.parentElement.querySelector(`[data-gcpiece="${sheetNo}"]`);
     openSim(sheetNo, sel && sel.value ? sel.value : null, Number(g.dataset.layer || 0));
@@ -2840,14 +2923,14 @@ function buildPDF(){
   h2('Material e montagem');
   kv([['Chapa', R.mat.name + ' (' + R.mat.type + ')  ' + mm(R.mat.w) + ' x ' + mm(R.mat.h) + ' mm  esp. ' + fmtNum(R.mat.t, 1) + ' mm'].map((c, i) => i ? c : c),
     ['Sentido', (r.orient === 'standing' ? 'Em pé' : 'Deitada') + '  |  início pela ' + START_NAME[r.start].toLowerCase() + (P.studs > 0 ? '  |  montantes a cada ' + mm(P.studs) + ' mm' : '  |  sem montantes')],
-    ['Juntas', (P.studs > 0 ? 'vertical no eixo do montante' : 'vertical ' + mm(P.gapV) + ' mm') + '  |  horizontal ' + mm(P.gapH) + ' mm  |  serra ' + mm(P.kerf) + ' mm  |  folga do piso ' + mm(P.floorGap || 0) + ' mm' + (P.stagger > 0 ? '  |  desencontro min. ' + mm(P.stagger) + ' mm' : '')]], [0, 22]);
+    ['Juntas', (P.studs > 0 ? 'vertical no eixo do montante' : 'vertical ' + mm(P.gapV) + ' mm') + '  |  horizontal ' + mm(P.gapH) + ' mm  |  serra ' + mm(P.kerf) + ' mm  |  folga do piso ' + mm(P.floorGap || 0) + ' mm (desencontro mín. de juntas: por parede, veja a tabela "Paredes")']], [0, 22]);
   h2('Balanço de áreas');
   kv([['Área da parede (bruta)', fmtA(m.gross), 'Área comprada', fmtA(m.nominal)], ['Aberturas', fmtA(m.openArea), 'Área utilizada (peças)', fmtA(m.pieceArea)], ['Área a revestir', fmtA(m.net), 'Sobra total', fmtA(m.waste)],
     ['Folga do piso + juntas', fmtA(m.floorArea + m.jointArea), 'Sobra reaproveitável', fmtA(m.reusableArea)], ['Recuo ao redor das aberturas', fmtA(m.marginArea), 'Resíduo', fmtA(m.residueArea)],
     ['Aproveitamento (útil/comprada)', fmtP(m.util), 'Desperdício', fmtP(m.wastePct)], ['Parede bruta / comprada', fmtP(m.wallOverNominal), '', '']], [0, 52, 96, 140]);
   h2('Paredes');
-  table([{ t: 'Parede', w: 40 }, { t: 'Dimensões (mm)', w: 40, a: 'r' }, { t: 'Área bruta', w: 30, a: 'r' }, { t: 'Aberturas', w: 30, a: 'r' }, { t: 'Inteiras', w: 20, a: 'r' }, { t: 'Cortadas', w: 26, a: 'r' }],
-    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length]));
+  table([{ t: 'Parede', w: 32 }, { t: 'Dimensões (mm)', w: 36, a: 'r' }, { t: 'Área bruta', w: 26, a: 'r' }, { t: 'Aberturas', w: 26, a: 'r' }, { t: 'Inteiras', w: 18, a: 'r' }, { t: 'Cortadas', w: 24, a: 'r' }, { t: 'Desenc. juntas', w: 24, a: 'r' }],
+    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-']));
   // paginação de cada parede
   r.entries.forEach(e => {
     const ratio = e.wall.h / e.wall.w, boxW = PW - 2 * M, boxH = Math.min(118, Math.max(60, boxW * ratio));
