@@ -398,6 +398,25 @@ function studAxes(W, M, start){
   for (let x = M; x < W - 0.5; x += M) a.push(start === 'right' ? W - x : x);
   return a.sort((x, y) => x - y);
 }
+/* Sobra da modulação dos montantes: o(s) trecho(s) de parede, numa ou nas duas extremidades, menores
+   que a modulação cheia (M). Resultado 100% objetivo, direto da grade de montantes já calculada (não
+   depende de quem está "olhando" a parede) -- serve pra conferir, sem ambiguidade, que a sobra cai do
+   mesmo lado físico nas duas faces quando a parede usa a opção "duas faces". */
+function studLeftover(W, M, start){
+  if (!(M > 0)) return [];
+  const axes = studAxes(W, M, start), bounds = [0].concat(axes, [W]).sort((a, b) => a - b), out = [];
+  for (let i = 0; i < bounds.length - 1; i++){
+    const a = bounds[i], b = bounds[i + 1], len = b - a;
+    if (len < M - 1 && (a < 0.5 || b > W - 0.5)) out.push({ side: a < 0.5 ? 'esquerda' : 'direita', size: len, from: a, to: b });
+  }
+  return out;
+}
+/* Texto curto (pra tabelas) com a sobra da modulação de UMA parede, no mesmo cálculo objetivo de studLeftover. */
+function leftoverLabel(wall, r){
+  if (!(S.params.studs > 0)) return '—';
+  const lv = studLeftover(wall.w, S.params.studs, r.start);
+  return lv.length ? lv.map(x => mm(x.size) + ' mm (' + x.side + ')').join(' + ') : 'sem sobra (múltiplo exato)';
+}
 
 /* ---------- 2) paginação da parede ----------
    Monta as fiadas (de baixo p/ cima) e as colunas de cada fiada.
@@ -765,6 +784,18 @@ function optimizeLayout(pieces, sw, sh, kerf, allowRot, effort){
   return best;
 }
 
+/* ---------- "duas faces": a parede tem revestimento nos dois lados (ex.: OSB-montante-OSB) e a MESMA
+   modulação (montantes, juntas, início, sobra) é a referência única pras duas faces -- a geometria da
+   paginação (calculateLayout) é calculada UMA única vez; cada face só precisa da sua PRÓPRIA cópia das
+   peças, porque o encaixe nas chapas físicas marca cada peça com a chapa/rótulo que ela ocupou, e isso
+   tem que ser independente por face (senão uma face sobrescreve o resultado da outra nas mesmas peças,
+   já que a paginação -- e portanto a lista de peças -- é idêntica nas duas). */
+function faceWall(wall, face){
+  return Object.assign({}, wall, { id: wall.id + '#' + face, name: wall.name + (face === 'ext' ? ' — Face Externa' : ' — Face Interna') });
+}
+function cloneLayForFace(lay, faceW){
+  return Object.assign({}, lay, { pieces: lay.pieces.map(p => Object.assign({}, p, { wallId: faceW.id, wallName: faceW.name })) });
+}
 /* ---------- 4) solução completa para uma combinação (orientação + início) ---------- */
 function solve(S, mat, orient, start, effort){
   const P = S.params;
@@ -787,7 +818,13 @@ function solve(S, mat, orient, start, effort){
     const wallP = Object.assign({}, P, { stagger: wall.stagger || 0 });
     const lay = calculateLayout(wall, sw, sh, wallP, start);
     if (lay.error) return { error: `${wall.name}: ${lay.error}` };
-    entries.push({ wall, lay });
+    if (wall.twoFaces){
+      const fe = faceWall(wall, 'ext'), fi = faceWall(wall, 'int');
+      entries.push({ wall: fe, lay: cloneLayForFace(lay, fe), realWallId: wall.id });
+      entries.push({ wall: fi, lay: cloneLayForFace(lay, fi), realWallId: wall.id });
+    } else {
+      entries.push({ wall, lay, realWallId: wall.id });
+    }
   }
   const sheets = [];
   // chapas inteiras (peça = chapa): não entram no nesting
@@ -817,24 +854,30 @@ function solve(S, mat, orient, start, effort){
 /* ---------- 5) indicadores, sobras e resíduos ---------- */
 function calculateRemnants(entries, sheets, sw, sh, P){
   const m = {};
+  // "duas faces" cria 2 entries por parede física (mesma modulação; chapas e cortes dobram de propósito,
+  // porque realmente se usa o dobro de material físico, uma chapa por face) -- mas a ÁREA FÍSICA da
+  // parede em si (bruta, aberturas, folga do piso, recuo) é UMA só e não pode ser somada 2x. Dedup por
+  // parede real (realWallId) só para essas métricas de área/qualidade da parede; tudo que vem de
+  // "sheets" (chapas, peças, cortes, sobra) já reflete o consumo real das 2 faces, sem precisar de dedup.
+  const physEntries = []; { const seen = new Set(); entries.forEach(e => { if (!seen.has(e.realWallId)){ seen.add(e.realWallId); physEntries.push(e); } }); }
   m.nSheets = sheets.length;
   m.nWholeClean = sheets.filter(s => s.kind === 'whole' && !s.trimmed).length;
   m.nWholeTrim = sheets.filter(s => s.kind === 'whole' && s.trimmed).length;
   m.nCutSheets = sheets.filter(s => s.kind === 'cut').length;
-  m.cornerViol = entries.reduce((n, e) => n + (e.lay.cornerViol || 0), 0);   // juntas que não respeitam a distância dos cantos
-  m.layerShort = Math.round(entries.reduce((n, e) => n + (e.lay.layerShort || 0), 0)); // quanto falta (mm) para o desencontro entre camadas
-  m.minLayer = Math.min(...entries.map(e => e.lay.minLayer === undefined ? Infinity : e.lay.minLayer));
-  m.staggerShort = Math.round(entries.reduce((n, e) => n + (e.lay.staggerShort || 0), 0)); // quanto falta (mm, somando as fiadas) para o desencontro mínimo
+  m.cornerViol = physEntries.reduce((n, e) => n + (e.lay.cornerViol || 0), 0);   // juntas que não respeitam a distância dos cantos
+  m.layerShort = Math.round(physEntries.reduce((n, e) => n + (e.lay.layerShort || 0), 0)); // quanto falta (mm) para o desencontro entre camadas
+  m.minLayer = Math.min(...physEntries.map(e => e.lay.minLayer === undefined ? Infinity : e.lay.minLayer));
+  m.staggerShort = Math.round(physEntries.reduce((n, e) => n + (e.lay.staggerShort || 0), 0)); // quanto falta (mm, somando as fiadas) para o desencontro mínimo
   m.sheetArea = sw * sh;
   m.nominal = m.nSheets * m.sheetArea;
-  m.gross = entries.reduce((s, e) => s + calculateWallArea(e.wall), 0);
-  m.openArea = entries.reduce((s, e) => s + openingsArea(e.wall), 0);
+  m.gross = physEntries.reduce((s, e) => s + calculateWallArea(e.wall), 0);
+  m.openArea = physEntries.reduce((s, e) => s + openingsArea(e.wall), 0);
   m.net = m.gross - m.openArea;
   m.pieceArea = 0; sheets.forEach(s => s.placed.forEach(pl => { m.pieceArea += plArea(pl); }));
   // Áreas de folga do piso e de recuo ao redor das aberturas, por união exata de retângulos (sem contar 2x
   // quando dois recuos se sobrepõem ou quando o recuo invade a folga do piso).
   m.floorArea = 0; m.marginArea = 0;
-  entries.forEach(e => {
+  physEntries.forEach(e => {
     const W = e.wall.w, H = e.wall.h, fg = P.floorGap > 0 ? P.floorGap : 0;
     const ops = e.wall.openings.map(o => ({ x0: o.x, x1: o.x + o.w, y0: o.y, y1: o.y + o.h }));
     const cuts = e.wall.openings.map(o => openingCutRect(o, W, H));
@@ -974,7 +1017,7 @@ const MAT_TYPES = ['OSB', 'Placa cimentícia', 'Compensado', 'MDF', 'MDP', 'Dryw
 // stagger/staggerCustom: desencontro mínimo das juntas -- é POR PAREDE (cada parede pode ter o seu
 // próprio valor, diferente das outras), ao contrário dos demais parâmetros de montagem (modulação,
 // juntas, orientação etc.), que continuam valendo pra todas as paredes do projeto.
-function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false }; }
+function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false, twoFaces: false }; }
 // Migração: antes o desencontro mínimo era um único valor do projeto (S.params.stagger), aplicado a
 // TODAS as paredes por igual -- o que forçava o mesmo valor em todas. Paredes salvas antes dessa
 // mudança não têm wall.stagger ainda; herdam o valor antigo do projeto uma única vez (preservando o
@@ -1185,7 +1228,7 @@ function renderInputs(){
 function renderWallList(){
   const el = $('#wallList'); if (!el) return;
   el.innerHTML = S.walls.map(w => `<div class="wall-item ${w.id === S.activeWall ? 'on' : ''}">
-    <button class="nm" data-act="selWall" data-id="${w.id}"><b>${esc(w.name || 'Parede')}</b><small>${isFinite(w.w) && isFinite(w.h) ? fmtDim(w.w, w.h) : 'medidas inválidas'}${w.openings.length ? ' · ' + w.openings.length + ' abertura(s)' : ''}</small></button>
+    <button class="nm" data-act="selWall" data-id="${w.id}"><b>${esc(w.name || 'Parede')}${w.twoFaces ? ' <small style="font-weight:400;opacity:.75">(2 faces)</small>' : ''}</b><small>${isFinite(w.w) && isFinite(w.h) ? fmtDim(w.w, w.h) : 'medidas inválidas'}${w.openings.length ? ' · ' + w.openings.length + ' abertura(s)' : ''}</small></button>
     <button class="icon-btn" title="Duplicar parede" aria-label="Duplicar parede" data-act="dupWall" data-id="${w.id}">⧉</button>
     <button class="icon-btn" title="Excluir parede" aria-label="Excluir parede" data-act="delWall" data-id="${w.id}">✕</button></div>`).join('');
 }
@@ -1198,6 +1241,10 @@ function renderWallForm(){
   el.innerHTML = `
     <label class="f" style="margin-bottom:10px"><span>Nome da parede</span><div class="inp"><input type="text" data-wall="name" value="${esc(w.name)}"></div></label>
     <div class="grid2">${lenField('Largura da parede', w.w, 'data-wall="w"')}${lenField('Altura da parede', w.h, 'data-wall="h"')}</div>
+    <label class="check" style="margin-top:10px"><input type="checkbox" data-wall="twoFaces" ${w.twoFaces ? 'checked' : ''}> Revestir as duas faces (externa e interna)</label>
+    <p class="hint" style="margin:4px 0 0">${w.twoFaces
+      ? 'A mesma modulação (montantes, juntas, início e sobra) vale para as duas faces — o sistema gera a lista de chapas, cortes e programas de usinagem separadamente para a Face Externa e a Face Interna, mas a partir de UMA única paginação, garantindo que as duas fiquem sempre consistentes entre si.'
+      : 'Marque quando esta parede for fechada com chapa dos dois lados (ex.: OSB — montante — OSB). A área e o aproveitamento continuam calculados pela parede; a quantidade de chapas e cortes passa a contar as duas faces.'}</p>
     <label class="f" style="margin-top:10px"><span>Desencontro mínimo das juntas (só desta parede)</span><div class="inp"><select data-wall="staggerMode" aria-label="Desencontro mínimo das juntas desta parede">
       ${P.studs > 0
         ? `<option value="0" ${w.stagger > 0 ? '' : 'selected'}>Sem desencontro</option>` + staggerOptions(P).map((v, i) => `<option value="${v}" ${w.stagger === v ? 'selected' : ''}>${mm(v)} mm (${i + 1}x a modulação)</option>`).join('')
@@ -1230,6 +1277,7 @@ document.addEventListener('change', e => {
   if (t.dataset.unit != null){ S.unit = t.value; renderInputs(); }
   else if (t.dataset.wall){
     if (t.dataset.wall === 'name'){ w.name = t.value.trim() || 'Parede'; }
+    else if (t.dataset.wall === 'twoFaces'){ w.twoFaces = t.checked; renderWallForm(); }
     else if (t.dataset.wall === 'staggerMode'){
       if (t.value === 'custom'){ w.staggerCustom = true; if (!(w.stagger > 0)) w.stagger = 500; }
       else { w.staggerCustom = false; w.stagger = Number(t.value); }
@@ -1319,7 +1367,10 @@ function recalc(force){
   if (res.error){ R = null; RC = null; renderResults(['Não foi possível paginar: ' + res.error + '.']); return; }
   R = Object.assign(res, { mat });
   computeClad();
-  if (!S.walls.some(w => w.id === UI.wallId)) UI.wallId = S.walls[0].id;
+  // UI.wallId aponta pro "e.wall.id" de uma ENTRADA do resultado (não de S.walls direto): com "duas
+  // faces", a parede real não aparece como entrada "crua" -- só como Face Externa/Interna (ids
+  // sintéticos) -- então a validação tem que ser contra as entradas de verdade, não contra S.walls.
+  if (!R.sel.r.entries.some(e => e.wall.id === UI.wallId)) UI.wallId = R.sel.r.entries[0].wall.id;
   renderResults();
   if (force) $('#results').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -1435,7 +1486,22 @@ function renderWall(entry, r, opts){
     }
   });
   if (S.params.showStuds && S.params.studs > 0 && !opts.noStuds){
-    studAxes(W, S.params.studs, r.start).forEach(x => { s += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.1}" stroke-dasharray="${fs * 0.5} ${fs * 0.4}" opacity=".7"/>`; });
+    const M = S.params.studs, axes = studAxes(W, M, r.start);
+    axes.forEach(x => { s += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.1}" stroke-dasharray="${fs * 0.5} ${fs * 0.4}" opacity=".7"/>`; });
+    // cota dos montantes: distância de cada um até a extremidade esquerda do desenho -- referência física
+    // fixa (não depende de "esquerda/direita" de quem olha), a mesma nas duas faces quando a parede usa a
+    // opção "duas faces". Linha de cota própria, junto ao piso, pra não se misturar com a cota geral de largura.
+    const dyM = H + mg * 0.42, tick = fs * 0.35;
+    s += `<g stroke="var(--muted)" stroke-width="${fs * 0.06}" fill="var(--muted)">
+      <line x1="0" y1="${dyM}" x2="${W}" y2="${dyM}"/>
+      ${[0].concat(axes, [W]).map(x => `<line x1="${x}" y1="${dyM - tick}" x2="${x}" y2="${dyM + tick}"/>`).join('')}
+      ${axes.map(x => `<text x="${x}" y="${dyM + fs * 1.3}" text-anchor="middle" font-size="${fs * 0.6}" stroke="none">${fmtLen(x)}</text>`).join('')}
+    </g>`;
+    studLeftover(W, M, r.start).forEach(lv => {
+      const mx = (lv.from + lv.to) / 2;
+      s += `<rect x="${lv.from}" y="0" width="${lv.to - lv.from}" height="${H}" fill="var(--warn)" opacity=".1"/>
+        <text x="${mx}" y="${dyM + fs * 2.3}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)" stroke="none">sobra da modulação: ${mm(lv.size)} mm (lado ${lv.side})</text>`;
+    });
   }
   s += texts;
   if (S.params.isClad){   // juntas do OSB (referência): o revestimento não pode alinhar com elas
@@ -1562,7 +1628,7 @@ function paneList(){
 function paneRes(){
   const r = R.sel.r, m = r.metrics;
   const rows = r.sheets.map(s => { const used = s.placed.reduce((a, p) => a + plArea(p), 0); return `<tr><td>${s.no}</td><td>${s.kind === 'whole' && !s.trimmed ? 'Inteira' : s.kind === 'whole' ? 'Inteira c/ ajuste' : 'Cortada'}</td><td class="n">${fmtA4(m.sheetArea)}</td><td class="n">${fmtA4(used)}</td><td class="n">${fmtA4(m.sheetArea - used)}</td><td class="n">${fmtP(used / m.sheetArea * 100)}</td><td class="n">${s.cuts}</td></tr>`; }).join('');
-  const wallRows = r.entries.map(e => { const pc = e.lay.pieces, area = pc.reduce((a, p) => a + pieceArea(p), 0); return `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${fmtA(openingsArea(e.wall))}</td><td class="n">${fmtA(area)}</td><td class="n">${pc.filter(p => p.whole).length}</td><td class="n">${pc.filter(p => !p.whole).length}</td></tr>`; }).join('');
+  const wallRows = r.entries.map(e => { const pc = e.lay.pieces, area = pc.reduce((a, p) => a + pieceArea(p), 0); return `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${fmtA(openingsArea(e.wall))}</td><td class="n">${fmtA(area)}</td><td class="n">${pc.filter(p => p.whole).length}</td><td class="n">${pc.filter(p => !p.whole).length}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`; }).join('');
   return `<div class="two">
     <div><h3 style="margin-bottom:6px">Balanço de áreas</h3><table class="bal"><tbody>
       <tr><td>Área da parede (bruta)</td><td class="n">${fmtA(m.gross)}</td></tr>
@@ -1588,7 +1654,7 @@ function paneRes(){
       ${m.remnants.length ? `<h3 style="margin:14px 0 6px">Sobras reaproveitáveis</h3><table><thead><tr><th>Chapa</th><th class="n">Dimensão (mm)</th><th class="n">Área</th></tr></thead><tbody>${m.remnants.map(x => `<tr><td>${x.sheet}</td><td class="n">${mm(x.w)} × ${mm(x.h)}</td><td class="n">${fmtA4(x.w * x.h)}</td></tr>`).join('')}</tbody></table>` : ''}</div></div>
     <h3 style="margin:18px 0 6px">Por chapa</h3><div class="tbl-wrap"><table><thead><tr><th>Chapa</th><th>Tipo</th><th class="n">Área da chapa</th><th class="n">Área utilizada</th><th class="n">Área sobra</th><th class="n">Aproveitamento</th><th class="n">Cortes</th></tr></thead><tbody>${rows}
       <tr class="tot"><td colspan="2">Total</td><td class="n">${fmtA4(m.nominal)}</td><td class="n">${fmtA4(m.pieceArea)}</td><td class="n">${fmtA4(m.waste)}</td><td class="n">${fmtP(m.util)}</td><td class="n">${m.cuts}</td></tr></tbody></table></div>
-    <h3 style="margin:18px 0 6px">Por parede</h3><div class="tbl-wrap"><table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área coberta</th><th class="n">Chapas inteiras</th><th class="n">Peças cortadas</th></tr></thead><tbody>${wallRows}</tbody></table></div>`;
+    <h3 style="margin:18px 0 6px">Por parede</h3><div class="tbl-wrap"><table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área coberta</th><th class="n">Chapas inteiras</th><th class="n">Peças cortadas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>${wallRows}</tbody></table></div>`;
 }
 function paneCmp(){
   const ordered = R.alts.slice();
@@ -1939,8 +2005,8 @@ function generateReport(){
   return `<div class="rep">
     <h1>${esc(S.name)}</h1><div class="meta">Relatório de paginação de chapas${P.isClad ? ' — REVESTIMENTO sobre o OSB' : ''} · ${date}</div>
     <h2>Dados do projeto</h2>
-    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Desenc. mín. juntas</th></tr></thead><tbody>
-      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td></tr>`).join('')}</tbody></table>
+    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Desenc. mín. juntas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>
+      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`).join('')}</tbody></table>
     <h2>Material e montagem</h2>
     <table><tbody>
       <tr><td>Chapa</td><td>${esc(R.mat.name)} (${esc(R.mat.type)}) · ${mm(R.mat.w)} × ${mm(R.mat.h)} mm · espessura ${fmtNum(R.mat.t, 1)} mm</td></tr>
@@ -2933,8 +2999,8 @@ function buildPDF(){
     ['Folga do piso + juntas', fmtA(m.floorArea + m.jointArea), 'Sobra reaproveitável', fmtA(m.reusableArea)], ['Recuo ao redor das aberturas', fmtA(m.marginArea), 'Resíduo', fmtA(m.residueArea)],
     ['Aproveitamento (útil/comprada)', fmtP(m.util), 'Desperdício', fmtP(m.wastePct)], ['Parede bruta / comprada', fmtP(m.wallOverNominal), '', '']], [0, 52, 96, 140]);
   h2('Paredes');
-  table([{ t: 'Parede', w: 32 }, { t: 'Dimensões (mm)', w: 36, a: 'r' }, { t: 'Área bruta', w: 26, a: 'r' }, { t: 'Aberturas', w: 26, a: 'r' }, { t: 'Inteiras', w: 18, a: 'r' }, { t: 'Cortadas', w: 24, a: 'r' }, { t: 'Desenc. juntas', w: 24, a: 'r' }],
-    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-']));
+  table([{ t: 'Parede', w: 30 }, { t: 'Dimensões (mm)', w: 30, a: 'r' }, { t: 'Área bruta', w: 24, a: 'r' }, { t: 'Aberturas', w: 22, a: 'r' }, { t: 'Inteiras', w: 16, a: 'r' }, { t: 'Cortadas', w: 20, a: 'r' }, { t: 'Desenc. juntas', w: 20, a: 'r' }, { t: 'Sobra modulação', w: 24, a: 'r' }],
+    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-', leftoverLabel(e.wall, r)]));
   // paginação de cada parede
   r.entries.forEach(e => {
     const ratio = e.wall.h / e.wall.w, boxW = PW - 2 * M, boxH = Math.min(118, Math.max(60, boxW * ratio));
