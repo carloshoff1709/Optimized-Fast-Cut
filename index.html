@@ -998,9 +998,9 @@ function normClad(st){
 function defaultState(){
   const w = newWall('P01', 3000, 3000);
   return { id: null, name: 'Novo projeto', unit: 'mm', walls: [w], activeWall: w.id, materialId: 'm-apaplus',
-    params: { orientation: 'auto', start: 'left', studs: 0, studsCustom: false, gapV: 3, gapH: 3, floorGap: 10, cornerClear: 200, kerf: 3, tol: 0, minRem: 300, rotate: false, share: true, showStuds: true,
-      cncMachine: 'RHINO 3000S', cncPost: 'ABSOLUTE 3000 ATC (mm) (*.tap)', cncTool: 1, cncToolName: 'Topo raso 4mm', cncRpm: 18000, cncFeed: 3000, cncPlunge: 300, cncPasses: 3, cncOvercut: 1, cncSafeZ: 20, cncHomeZ: 20.32, cncTableX: 1900, cncTableY: 2800,
-      cncEngrave: true, cncEngraveDepth: 1, cncEngraveFeed: 2500, cncEngraveHeight: 100 },
+    params: { orientation: 'auto', start: 'left', studs: 0, studsCustom: false, gapV: 3, gapH: 3, floorGap: 10, cornerClear: 200, kerf: 4, tol: 0, minRem: 300, rotate: false, share: true, showStuds: true,
+      cncMachine: 'RHINO 3000S', cncPost: 'ABSOLUTE 3000 ATC (mm) (*.tap)', cncTool: 1, cncToolName: 'Topo raso 4mm', cncRpm: 18000, cncFeed: 3000, cncPlunge: 300, cncPasses: 2, cncOvercut: 1, cncSafeZ: 20, cncHomeZ: 20.32, cncTableX: 1900, cncTableY: 2800,
+      cncEngrave: true, cncEngraveDepth: 1, cncEngraveFeed: 2500, cncEngraveHeight: 60 },
     clad: defaultClad() };
 }
 function lsGet(k, d){ try { const v = localStorage.getItem(NS + k); return v ? JSON.parse(v) : d; } catch (e){ return d; } }
@@ -1195,14 +1195,14 @@ function renderWallForm(){
   const w = activeWall(); if (!w){ el.innerHTML = '<p class="empty">Adicione uma parede.</p>'; return; }
   const P = S.params;
   snapWallStagger(w, P);
-  const wStagMode = w.staggerCustom ? 'custom' : ([0, 300, 400, 600].includes(w.stagger) ? String(w.stagger) : 'custom');
+  const wStagMode = w.staggerCustom ? 'custom' : ([0, 400, 600, 1200].includes(w.stagger) ? String(w.stagger) : 'custom');
   el.innerHTML = `
     <label class="f" style="margin-bottom:10px"><span>Nome da parede</span><div class="inp"><input type="text" data-wall="name" value="${esc(w.name)}"></div></label>
     <div class="grid2">${lenField('Largura da parede', w.w, 'data-wall="w"')}${lenField('Altura da parede', w.h, 'data-wall="h"')}</div>
     <label class="f" style="margin-top:10px"><span>Desencontro mínimo das juntas (só desta parede)</span><div class="inp"><select data-wall="staggerMode" aria-label="Desencontro mínimo das juntas desta parede">
       ${P.studs > 0
         ? `<option value="0" ${w.stagger > 0 ? '' : 'selected'}>Sem desencontro</option>` + staggerOptions(P).map((v, i) => `<option value="${v}" ${w.stagger === v ? 'selected' : ''}>${mm(v)} mm (${i + 1}x a modulação)</option>`).join('')
-        : `<option value="0" ${wStagMode === '0' ? 'selected' : ''}>Sem desencontro</option><option value="300" ${wStagMode === '300' ? 'selected' : ''}>300 mm</option><option value="400" ${wStagMode === '400' ? 'selected' : ''}>400 mm</option><option value="600" ${wStagMode === '600' ? 'selected' : ''}>600 mm</option><option value="custom" ${wStagMode === 'custom' ? 'selected' : ''}>Personalizado</option>`}
+        : `<option value="0" ${wStagMode === '0' ? 'selected' : ''}>Sem desencontro</option><option value="400" ${wStagMode === '400' ? 'selected' : ''}>400 mm</option><option value="600" ${wStagMode === '600' ? 'selected' : ''}>600 mm</option><option value="1200" ${wStagMode === '1200' ? 'selected' : ''}>1200 mm</option><option value="custom" ${wStagMode === 'custom' ? 'selected' : ''}>Personalizado</option>`}
     </select></div></label>
     ${wStagMode === 'custom' && !(P.studs > 0) ? `<div style="margin-top:10px">${lenField('Deslocamento mínimo entre juntas desta parede', w.stagger, 'data-wall="stagger"', 'mm')}</div>` : ''}
     <hr class="sep">
@@ -2097,7 +2097,7 @@ function pieceEngraveCuts(pl, text, heightMM, mirrorFix){
   if (!raw) return [];
   const { origins, widthUnits } = glyphOrigins(raw);
   if (!origins.length || widthUnits <= 0) return [];
-  const H = heightMM > 0 ? heightMM : 100;
+  const H = heightMM > 0 ? heightMM : 60;
   const target = engraveTargetRect(pl);
   const rotate = target.h > target.w;
   const availW = (rotate ? target.h : target.w) - 2 * ENGRAVE_MARGIN, availH = (rotate ? target.w : target.h) - 2 * ENGRAVE_MARGIN;
