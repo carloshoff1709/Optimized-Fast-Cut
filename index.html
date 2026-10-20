@@ -803,6 +803,22 @@ function faceWall(wall, face){
 function cloneLayForFace(lay, faceW){
   return Object.assign({}, lay, { pieces: lay.pieces.map(p => Object.assign({}, p, { wallId: faceW.id, wallName: faceW.name })) });
 }
+/* Gravação "sempre à vista" em peça com recorte (vão de porta/janela) na Face Interna: virar a chapa pra
+   trocar qual face fica gravada-pra-fora espelha esquerda/direita (é a mesma rotação 3D explicada ao
+   Carlos -- virar sem derrubar mantém "cima" no lugar, e isso OBRIGA a inverter o outro eixo). Então, se o
+   corte da Face Interna fosse feito igual ao da Externa, ao montar virada (gravação à vista) o recorte cai
+   do lado ERRADO do vão. A correção é só no CORTE: espelhamos o recorte dentro da própria peça (em volta do
+   seu centro), sem alterar onde a peça fica na parede (x/largura da peça continuam os mesmos -- a junta
+   continua caindo no mesmo montante real nas duas faces). A Vista da Parede (puramente visual, em renderWall)
+   já espelha a Face Interna inteira por um caminho separado e não usa esta função -- os dois espelhamentos
+   não se combinam porque atuam em cópias diferentes da peça (ver uso em solve()).                        */
+function mirrorPieceLocal(p){
+  if (!p.voids || !p.voids.length) return p;
+  const cx = p.x + p.w / 2, mirrorR = r => ({ x0: 2 * cx - r.x1, x1: 2 * cx - r.x0, y0: r.y0, y1: r.y1 });
+  const voids = p.voids.map(mirrorR), body = p.body.map(mirrorR);
+  const d = describeShape({ x0: p.x, x1: p.x + p.w, y0: p.y, y1: p.y + p.h }, voids);
+  return Object.assign({}, p, { body, voids, shape: d.shape, shapeDesc: d.desc, __orig: p });
+}
 /* ---------- 4) solução completa para uma combinação (orientação + início) ---------- */
 function solve(S, mat, orient, start, effort){
   const P = S.params;
@@ -842,8 +858,11 @@ function solve(S, mat, orient, start, effort){
     if (trimH){ cutLines.push({ x1: 0, y1: p.h + P.kerf / 2, x2: sw, y2: p.h + P.kerf / 2 }); cuts++; kerfArea += sw * P.kerf; }
     sheets.push({ kind: 'whole', trimmed: trimW || trimH, placed: [{ x: 0, y: 0, w: p.w, h: p.h, rot: false, piece: p }], free: [], cutLines, cuts, kerfArea });
   }));
-  // demais peças: nesting (compartilhando sobras entre paredes, se marcado)
-  const pools = P.share ? [entries.flatMap(e => e.lay.pieces.filter(p => !p.whole))] : entries.map(e => e.lay.pieces.filter(p => !p.whole));
+  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). Na Face Interna, manda pro
+  // corte uma cópia com o recorte espelhado (mirrorPieceLocal) -- é peça "whole" nunca tem recorte, então
+  // só entra aqui; a Vista da Parede continua lendo a peça original (não-espelhada) em e.lay.pieces.
+  const cutPieces = e => e.lay.pieces.filter(p => !p.whole).map(p => e.wall.face === 'int' ? mirrorPieceLocal(p) : p);
+  const pools = P.share ? [entries.flatMap(cutPieces)] : entries.map(cutPieces);
   for (const pool of pools){
     const packed = optimizeLayout(pool, sw, sh, P.kerf, P.rotate, effort);
     if (packed === null) return { error: 'uma peça não cabe na chapa (verifique as medidas)' };
@@ -852,7 +871,12 @@ function solve(S, mat, orient, start, effort){
   sheets.forEach((s, i) => {
     s.no = i + 1;
     s.placed.sort((a, b) => a.y - b.y || a.x - b.x);
-    s.placed.forEach((pl, k) => { pl.piece.sheet = s.no; pl.piece.label = s.kind === 'whole' ? String(s.no) : s.no + '.' + (k + 1); pl.piece.rot = pl.rot; });
+    s.placed.forEach((pl, k) => {
+      pl.piece.sheet = s.no; pl.piece.label = s.kind === 'whole' ? String(s.no) : s.no + '.' + (k + 1); pl.piece.rot = pl.rot;
+      // pl.piece pode ser a cópia espelhada (mirrorPieceLocal); a peça original, usada na Vista da
+      // Parede, precisa do mesmo número de chapa/peça pra mostrar o rótulo certo no desenho da parede.
+      if (pl.piece.__orig) Object.assign(pl.piece.__orig, { sheet: pl.piece.sheet, label: pl.piece.label, rot: pl.piece.rot });
+    });
     s.free.forEach(f => { f.reusable = Math.min(f.w, f.h) >= P.minRem; });
   });
   return { orient, start, sw, sh, entries, sheets, metrics: calculateRemnants(entries, sheets, sw, sh, P) };
@@ -1623,14 +1647,15 @@ function panePlan(){
   <div class="sheet-grid">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>${legend()}`;
 }
 // Regra de instalação da face gravada: o desenho abaixo mostra a peça exatamente como ela fica na
-// mesa da CNC (face gravada "pra cima") -- o app não sabe nem controla qual face física vai ficar
-// visível depois de pronta, isso é decidido na hora de montar (pra qual lado a chapa é virada). Por
-// pedido do Carlos, a face gravada deve SEMPRE ficar voltada para o lado visível (fachada/ambiente),
-// nos dois lados de uma parede de duas faces -- nunca escondida contra o montante. Isso não exige
-// nenhuma mudança na geometria/corte (o desenho já representa a face gravada, que é a face visível
-// depois de instalada); é só a regra de montagem que precisa ficar explícita pro operador.
+// mesa da CNC (face gravada "pra cima"). Por pedido do Carlos, a face gravada deve SEMPRE ficar voltada
+// para o lado visível (fachada/ambiente), nos dois lados de uma parede de duas faces -- nunca escondida
+// contra o montante; isso é uma regra de MONTAGEM (o app não decide pra qual lado a chapa é virada).
+// Virar a chapa pra cumprir essa regra na Face Interna espelha esquerda/direita (não cima/baixo) --
+// por isso, nas peças com recorte (vão de porta/janela), o corte da Face Interna já SAI da mesa da CNC
+// com o recorte espelhado dentro da própria peça (ver mirrorPieceLocal/solve()), pra cair no lado certo
+// do vão depois de virada. A nota abaixo só precisa deixar a regra de montagem explícita pro operador.
 function engraveInstallNote(){
-  return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante. Vale para as duas faces de uma parede de duas faces.</div>`;
+  return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante. Em peças com recorte (vão de porta/janela), o corte da Face Interna já vem ajustado para essa regra. Vale para as duas faces de uma parede de duas faces.</div>`;
 }
 function sheetCard(s, r){
   const used = s.placed.reduce((a, p) => a + plArea(p), 0), tot = r.sw * r.sh, { W, H, mdim } = sheetAxes(r);
