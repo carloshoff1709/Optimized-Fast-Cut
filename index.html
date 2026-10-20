@@ -2469,15 +2469,20 @@ function exportAllGcodeCollect(){
   if (errs.length){ toast('Corrija em "Programa de usinagem CNC": ' + errs[0] + '.'); return null; }
   const sheets = R.sel.r.sheets.filter(s => s.cutLines.length);
   if (!sheets.length){ toast('Nenhuma chapa tem corte a programar — só chapas inteiras, sem precisar programar a máquina.'); return null; }
+  if (!(window.jspdf && window.jspdf.jsPDF)){ toast('A biblioteca de PDF não carregou (sem internet?) — não foi possível montar o relatório para incluir no .zip.'); return null; }
   const folder = (S.name || 'projeto').replace(/[^\w\-]+/g, '_') + (CUR_LAYER ? '_revest' : '');
   const files = sheets.map(sheet => ({ name: folder + '_chapa' + sheet.no + '.txt', content: generateGcode(sheet, R.sel.r) }));
-  return { folder, files };
+  const pdf = buildPDF();   // mesmo relatório de paginação do botão "Exportar PDF", no mesmo contexto de camada (OSB ou revestimento)
+  return { folder, files, pdf };
 }
-async function zipAndSaveGcode({ folder, files }){
+// Estrutura do .zip pedida pelo Carlos: <Projeto>/ com o PDF (relatório de paginação) solto direto
+// nela, e dentro de <Projeto>/Usinagem_OSB/ os programas de usinagem (G-code) de cada chapa.
+async function zipAndSaveGcode({ folder, files, pdf }){
   if (typeof JSZip === 'undefined'){ toast('Não foi possível carregar o compactador de arquivos (.zip). Verifique a conexão e tente de novo.'); return; }
-  const zip = new JSZip(), sub = zip.folder(folder);
-  files.forEach(f => sub.file(f.name, f.content));
-  toast('Compactando ' + files.length + ' programa(s)...');
+  const zip = new JSZip(), proj = zip.folder(folder), usin = proj.folder('Usinagem_OSB');
+  files.forEach(f => usin.file(f.name, f.content));
+  proj.file(pdf.fname, pdf.blob);
+  toast('Compactando ' + files.length + ' programa(s) + relatório...');
   try {
     const blob = await zip.generateAsync({ type: 'blob' });
     await saveFile(folder + '.zip', blob);
