@@ -398,6 +398,28 @@ function studAxes(W, M, start){
   for (let x = M; x < W - 0.5; x += M) a.push(start === 'right' ? W - x : x);
   return a.sort((x, y) => x - y);
 }
+/* Sobra da modulação dos montantes: o(s) trecho(s) de parede, numa ou nas duas extremidades, menores
+   que a modulação cheia (M). Resultado 100% objetivo, direto da grade de montantes já calculada (não
+   depende de quem está "olhando" a parede) -- serve pra conferir, sem ambiguidade, que a sobra cai do
+   mesmo lado físico nas duas faces quando a parede usa a opção "duas faces". */
+function studLeftover(W, M, start){
+  if (!(M > 0)) return [];
+  const axes = studAxes(W, M, start), bounds = [0].concat(axes, [W]).sort((a, b) => a - b), out = [];
+  for (let i = 0; i < bounds.length - 1; i++){
+    const a = bounds[i], b = bounds[i + 1], len = b - a;
+    if (len < M - 1 && (a < 0.5 || b > W - 0.5)) out.push({ side: a < 0.5 ? 'esquerda' : 'direita', size: len, from: a, to: b });
+  }
+  return out;
+}
+/* Texto curto (pra tabelas) com a sobra da modulação de UMA parede, no mesmo cálculo objetivo de studLeftover. */
+function leftoverLabel(wall, r){
+  if (!(S.params.studs > 0)) return '—';
+  const lv = studLeftover(wall.w, S.params.studs, r.start);
+  // Face Interna é desenhada espelhada (ver renderWall) -- o lado dito aqui tem que bater com o que
+  // aparece no desenho e não com a coordenada "crua", senão a tabela contradiz a vista da parede.
+  const flip = wall.face === 'int';
+  return lv.length ? lv.map(x => mm(x.size) + ' mm (' + (flip ? (x.side === 'esquerda' ? 'direita' : 'esquerda') : x.side) + ')').join(' + ') : 'sem sobra (múltiplo exato)';
+}
 
 /* ---------- 2) paginação da parede ----------
    Monta as fiadas (de baixo p/ cima) e as colunas de cada fiada.
@@ -765,6 +787,22 @@ function optimizeLayout(pieces, sw, sh, kerf, allowRot, effort){
   return best;
 }
 
+/* ---------- "duas faces": a parede tem revestimento nos dois lados (ex.: OSB-montante-OSB) e a MESMA
+   modulação (montantes, juntas, início, sobra) é a referência única pras duas faces -- a geometria da
+   paginação (calculateLayout) é calculada UMA única vez; cada face só precisa da sua PRÓPRIA cópia das
+   peças, porque o encaixe nas chapas físicas marca cada peça com a chapa/rótulo que ela ocupou, e isso
+   tem que ser independente por face (senão uma face sobrescreve o resultado da outra nas mesmas peças,
+   já que a paginação -- e portanto a lista de peças -- é idêntica nas duas). */
+function faceWall(wall, face){
+  // "face" marcado no objeto pra quem desenha (renderWall/pdfWall) saber, sem precisar adivinhar pelo id,
+  // que a Face Interna tem que ser desenhada ESPELHADA -- é o que faz a vista bater com o que o montador
+  // vê de pé na frente de cada face (mesma peça/montante, visto do lado oposto). Os DADOS (posição de cada
+  // montante, corte, peça, gravação CNC) continuam idênticos e não-espelhados nas duas faces -- só o desenho muda.
+  return Object.assign({}, wall, { id: wall.id + '#' + face, face, name: wall.name + (face === 'ext' ? ' — Face Externa' : ' — Face Interna') });
+}
+function cloneLayForFace(lay, faceW){
+  return Object.assign({}, lay, { pieces: lay.pieces.map(p => Object.assign({}, p, { wallId: faceW.id, wallName: faceW.name })) });
+}
 /* ---------- 4) solução completa para uma combinação (orientação + início) ---------- */
 function solve(S, mat, orient, start, effort){
   const P = S.params;
@@ -787,7 +825,13 @@ function solve(S, mat, orient, start, effort){
     const wallP = Object.assign({}, P, { stagger: wall.stagger || 0 });
     const lay = calculateLayout(wall, sw, sh, wallP, start);
     if (lay.error) return { error: `${wall.name}: ${lay.error}` };
-    entries.push({ wall, lay });
+    if (wall.twoFaces){
+      const fe = faceWall(wall, 'ext'), fi = faceWall(wall, 'int');
+      entries.push({ wall: fe, lay: cloneLayForFace(lay, fe), realWallId: wall.id });
+      entries.push({ wall: fi, lay: cloneLayForFace(lay, fi), realWallId: wall.id });
+    } else {
+      entries.push({ wall, lay, realWallId: wall.id });
+    }
   }
   const sheets = [];
   // chapas inteiras (peça = chapa): não entram no nesting
@@ -817,24 +861,30 @@ function solve(S, mat, orient, start, effort){
 /* ---------- 5) indicadores, sobras e resíduos ---------- */
 function calculateRemnants(entries, sheets, sw, sh, P){
   const m = {};
+  // "duas faces" cria 2 entries por parede física (mesma modulação; chapas e cortes dobram de propósito,
+  // porque realmente se usa o dobro de material físico, uma chapa por face) -- mas a ÁREA FÍSICA da
+  // parede em si (bruta, aberturas, folga do piso, recuo) é UMA só e não pode ser somada 2x. Dedup por
+  // parede real (realWallId) só para essas métricas de área/qualidade da parede; tudo que vem de
+  // "sheets" (chapas, peças, cortes, sobra) já reflete o consumo real das 2 faces, sem precisar de dedup.
+  const physEntries = []; { const seen = new Set(); entries.forEach(e => { if (!seen.has(e.realWallId)){ seen.add(e.realWallId); physEntries.push(e); } }); }
   m.nSheets = sheets.length;
   m.nWholeClean = sheets.filter(s => s.kind === 'whole' && !s.trimmed).length;
   m.nWholeTrim = sheets.filter(s => s.kind === 'whole' && s.trimmed).length;
   m.nCutSheets = sheets.filter(s => s.kind === 'cut').length;
-  m.cornerViol = entries.reduce((n, e) => n + (e.lay.cornerViol || 0), 0);   // juntas que não respeitam a distância dos cantos
-  m.layerShort = Math.round(entries.reduce((n, e) => n + (e.lay.layerShort || 0), 0)); // quanto falta (mm) para o desencontro entre camadas
-  m.minLayer = Math.min(...entries.map(e => e.lay.minLayer === undefined ? Infinity : e.lay.minLayer));
-  m.staggerShort = Math.round(entries.reduce((n, e) => n + (e.lay.staggerShort || 0), 0)); // quanto falta (mm, somando as fiadas) para o desencontro mínimo
+  m.cornerViol = physEntries.reduce((n, e) => n + (e.lay.cornerViol || 0), 0);   // juntas que não respeitam a distância dos cantos
+  m.layerShort = Math.round(physEntries.reduce((n, e) => n + (e.lay.layerShort || 0), 0)); // quanto falta (mm) para o desencontro entre camadas
+  m.minLayer = Math.min(...physEntries.map(e => e.lay.minLayer === undefined ? Infinity : e.lay.minLayer));
+  m.staggerShort = Math.round(physEntries.reduce((n, e) => n + (e.lay.staggerShort || 0), 0)); // quanto falta (mm, somando as fiadas) para o desencontro mínimo
   m.sheetArea = sw * sh;
   m.nominal = m.nSheets * m.sheetArea;
-  m.gross = entries.reduce((s, e) => s + calculateWallArea(e.wall), 0);
-  m.openArea = entries.reduce((s, e) => s + openingsArea(e.wall), 0);
+  m.gross = physEntries.reduce((s, e) => s + calculateWallArea(e.wall), 0);
+  m.openArea = physEntries.reduce((s, e) => s + openingsArea(e.wall), 0);
   m.net = m.gross - m.openArea;
   m.pieceArea = 0; sheets.forEach(s => s.placed.forEach(pl => { m.pieceArea += plArea(pl); }));
   // Áreas de folga do piso e de recuo ao redor das aberturas, por união exata de retângulos (sem contar 2x
   // quando dois recuos se sobrepõem ou quando o recuo invade a folga do piso).
   m.floorArea = 0; m.marginArea = 0;
-  entries.forEach(e => {
+  physEntries.forEach(e => {
     const W = e.wall.w, H = e.wall.h, fg = P.floorGap > 0 ? P.floorGap : 0;
     const ops = e.wall.openings.map(o => ({ x0: o.x, x1: o.x + o.w, y0: o.y, y1: o.y + o.h }));
     const cuts = e.wall.openings.map(o => openingCutRect(o, W, H));
@@ -974,7 +1024,7 @@ const MAT_TYPES = ['OSB', 'Placa cimentícia', 'Compensado', 'MDF', 'MDP', 'Dryw
 // stagger/staggerCustom: desencontro mínimo das juntas -- é POR PAREDE (cada parede pode ter o seu
 // próprio valor, diferente das outras), ao contrário dos demais parâmetros de montagem (modulação,
 // juntas, orientação etc.), que continuam valendo pra todas as paredes do projeto.
-function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false }; }
+function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false, twoFaces: false }; }
 // Migração: antes o desencontro mínimo era um único valor do projeto (S.params.stagger), aplicado a
 // TODAS as paredes por igual -- o que forçava o mesmo valor em todas. Paredes salvas antes dessa
 // mudança não têm wall.stagger ainda; herdam o valor antigo do projeto uma única vez (preservando o
@@ -1185,7 +1235,7 @@ function renderInputs(){
 function renderWallList(){
   const el = $('#wallList'); if (!el) return;
   el.innerHTML = S.walls.map(w => `<div class="wall-item ${w.id === S.activeWall ? 'on' : ''}">
-    <button class="nm" data-act="selWall" data-id="${w.id}"><b>${esc(w.name || 'Parede')}</b><small>${isFinite(w.w) && isFinite(w.h) ? fmtDim(w.w, w.h) : 'medidas inválidas'}${w.openings.length ? ' · ' + w.openings.length + ' abertura(s)' : ''}</small></button>
+    <button class="nm" data-act="selWall" data-id="${w.id}"><b>${esc(w.name || 'Parede')}${w.twoFaces ? ' <small style="font-weight:400;opacity:.75">(2 faces)</small>' : ''}</b><small>${isFinite(w.w) && isFinite(w.h) ? fmtDim(w.w, w.h) : 'medidas inválidas'}${w.openings.length ? ' · ' + w.openings.length + ' abertura(s)' : ''}</small></button>
     <button class="icon-btn" title="Duplicar parede" aria-label="Duplicar parede" data-act="dupWall" data-id="${w.id}">⧉</button>
     <button class="icon-btn" title="Excluir parede" aria-label="Excluir parede" data-act="delWall" data-id="${w.id}">✕</button></div>`).join('');
 }
@@ -1198,6 +1248,10 @@ function renderWallForm(){
   el.innerHTML = `
     <label class="f" style="margin-bottom:10px"><span>Nome da parede</span><div class="inp"><input type="text" data-wall="name" value="${esc(w.name)}"></div></label>
     <div class="grid2">${lenField('Largura da parede', w.w, 'data-wall="w"')}${lenField('Altura da parede', w.h, 'data-wall="h"')}</div>
+    <label class="check" style="margin-top:10px"><input type="checkbox" data-wall="twoFaces" ${w.twoFaces ? 'checked' : ''}> Revestir as duas faces (externa e interna)</label>
+    <p class="hint" style="margin:4px 0 0">${w.twoFaces
+      ? 'A mesma modulação (montantes, juntas, início e sobra) vale para as duas faces — o sistema gera a lista de chapas, cortes e programas de usinagem separadamente para a Face Externa e a Face Interna, mas a partir de UMA única paginação, garantindo que as duas fiquem sempre consistentes entre si.'
+      : 'Marque quando esta parede for fechada com chapa dos dois lados (ex.: OSB — montante — OSB). A área e o aproveitamento continuam calculados pela parede; a quantidade de chapas e cortes passa a contar as duas faces.'}</p>
     <label class="f" style="margin-top:10px"><span>Desencontro mínimo das juntas (só desta parede)</span><div class="inp"><select data-wall="staggerMode" aria-label="Desencontro mínimo das juntas desta parede">
       ${P.studs > 0
         ? `<option value="0" ${w.stagger > 0 ? '' : 'selected'}>Sem desencontro</option>` + staggerOptions(P).map((v, i) => `<option value="${v}" ${w.stagger === v ? 'selected' : ''}>${mm(v)} mm (${i + 1}x a modulação)</option>`).join('')
@@ -1230,6 +1284,7 @@ document.addEventListener('change', e => {
   if (t.dataset.unit != null){ S.unit = t.value; renderInputs(); }
   else if (t.dataset.wall){
     if (t.dataset.wall === 'name'){ w.name = t.value.trim() || 'Parede'; }
+    else if (t.dataset.wall === 'twoFaces'){ w.twoFaces = t.checked; renderWallForm(); }
     else if (t.dataset.wall === 'staggerMode'){
       if (t.value === 'custom'){ w.staggerCustom = true; if (!(w.stagger > 0)) w.stagger = 500; }
       else { w.staggerCustom = false; w.stagger = Number(t.value); }
@@ -1319,7 +1374,10 @@ function recalc(force){
   if (res.error){ R = null; RC = null; renderResults(['Não foi possível paginar: ' + res.error + '.']); return; }
   R = Object.assign(res, { mat });
   computeClad();
-  if (!S.walls.some(w => w.id === UI.wallId)) UI.wallId = S.walls[0].id;
+  // UI.wallId aponta pro "e.wall.id" de uma ENTRADA do resultado (não de S.walls direto): com "duas
+  // faces", a parede real não aparece como entrada "crua" -- só como Face Externa/Interna (ids
+  // sintéticos) -- então a validação tem que ser contra as entradas de verdade, não contra S.walls.
+  if (!R.sel.r.entries.some(e => e.wall.id === UI.wallId)) UI.wallId = R.sel.r.entries[0].wall.id;
   renderResults();
   if (force) $('#results').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
@@ -1413,20 +1471,28 @@ function shapeTag(sh){ return sh === 'L' ? 'em L' : sh === 'U' ? 'em U' : sh ===
 function renderWall(entry, r, opts){
   opts = opts || {};
   const wall = entry.wall, lay = entry.lay, W = wall.w, H = wall.h;
+  // Espelhar: a Face Interna é a MESMA estrutura (montantes, peças, cortes -- nada disso muda) vista do
+  // lado oposto. Pra bater com o que o montador vê de pé na frente dela (sem trocar esquerda por direita
+  // na cabeça), o DESENHO da Face Interna é espelhado horizontalmente -- um <g transform> só, aplicado em
+  // cima de toda a geometria de uma vez (chapas, aberturas, recortes, montantes), garantindo que tudo
+  // dentro do desenho continua coerente entre si. Texto fica DE FORA desse grupo (senão sairia espelhado/
+  // ilegível) e tem sua posição X recalculada à mão via mx(); e os rótulos de lado (sobra) são invertidos
+  // junto. O plano de corte / gravação CNC não entra aqui -- aquilo é a mesa de corte, não tem "lado da
+  // parede", e a gravação tem que sair sempre legível, nunca espelhada.
+  const mirror = !!(opts.mirror || wall.face === 'int');
+  const mx = x => mirror ? W - x : x;
   const big = Math.max(W, H), mg = big * 0.075, fs = big / 55;
-  let s = `<svg class="wallsvg" viewBox="${-mg} ${-mg} ${W + 2 * mg} ${H + 2 * mg}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
-    <defs><pattern id="hatchW" width="${fs * 0.9}" height="${fs * 0.9}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="${fs * 0.9}" height="${fs * 0.9}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 0.9}" stroke="var(--accent)" stroke-width="${fs * 0.1}"/></pattern></defs>
-    <rect x="0" y="0" width="${W}" height="${H}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${fs * 0.1}"/>`;
+  let geo = `<rect x="0" y="0" width="${W}" height="${H}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${fs * 0.1}"/>`;
   let texts = '';
   lay.pieces.forEach(p => {
     const rects = pieceRects(p), fill = p.whole ? 'var(--whole)' : 'var(--cut)', lb = biggestRect(rects), tag = shapeTag(p.shape);
-    s += `<g><title>Chapa ${p.label}${p.whole ? ' (inteira)' : ' (peça cortada' + (p.shapeDesc ? ' · ' + p.shapeDesc : '') + ')'} · ${mm(p.w)} × ${mm(p.h)} mm</title>`;
+    geo += `<g><title>Chapa ${p.label}${p.whole ? ' (inteira)' : ' (peça cortada' + (p.shapeDesc ? ' · ' + p.shapeDesc : '') + ')'} · ${mm(p.w)} × ${mm(p.h)} mm</title>`;
     if (p.body){
-      rects.forEach(b => { s += `<rect x="${b.x}" y="${H - (b.y + b.h)}" width="${b.w}" height="${b.h}" fill="${fill}" stroke="${fill}" stroke-width="${fs * 0.03}"/>`; });
-      s += `<path d="${mergeCutSegs(unionOutline(rects), 0.01).map(c => `M${c.x1} ${H - c.y1}L${c.x2} ${H - c.y2}`).join('')}" fill="none" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
-    } else s += `<rect x="${p.x}" y="${H - (p.y + p.h)}" width="${p.w}" height="${p.h}" fill="${fill}" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
-    s += '</g>';
-    const cx = lb.x + lb.w / 2, cy = H - (lb.y + lb.h) + lb.h / 2, l1 = 'Chapa ' + p.label, l2 = mm(p.w) + ' × ' + mm(p.h), l3 = p.whole ? 'inteira' : (tag ? 'cortada ' + tag : 'cortada');
+      rects.forEach(b => { geo += `<rect x="${b.x}" y="${H - (b.y + b.h)}" width="${b.w}" height="${b.h}" fill="${fill}" stroke="${fill}" stroke-width="${fs * 0.03}"/>`; });
+      geo += `<path d="${mergeCutSegs(unionOutline(rects), 0.01).map(c => `M${c.x1} ${H - c.y1}L${c.x2} ${H - c.y2}`).join('')}" fill="none" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
+    } else geo += `<rect x="${p.x}" y="${H - (p.y + p.h)}" width="${p.w}" height="${p.h}" fill="${fill}" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
+    geo += '</g>';
+    const cx = mx(lb.x + lb.w / 2), cy = H - (lb.y + lb.h) + lb.h / 2, l1 = 'Chapa ' + p.label, l2 = mm(p.w) + ' × ' + mm(p.h), l3 = p.whole ? 'inteira' : (tag ? 'cortada ' + tag : 'cortada');
     if (lb.w > fs * 2 && lb.h > fs * 1.4){
       const small = !fsFit(l1, fs, lb.w) ? fs * 0.7 : fs;
       texts += `<text x="${cx}" y="${cy - (lb.h > fs * 4 ? fs * 0.7 : 0)}" text-anchor="middle" dominant-baseline="middle" font-size="${small}" font-weight="700" fill="var(--ink)" stroke="var(--panel)" stroke-width="${fs * 0.02}">${l1.replace('Chapa ', lb.w < fs * 5 ? '' : 'Chapa ')}</text>`;
@@ -1435,31 +1501,50 @@ function renderWall(entry, r, opts){
     }
   });
   if (S.params.showStuds && S.params.studs > 0 && !opts.noStuds){
-    studAxes(W, S.params.studs, r.start).forEach(x => { s += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.1}" stroke-dasharray="${fs * 0.5} ${fs * 0.4}" opacity=".7"/>`; });
+    const M = S.params.studs, axes = studAxes(W, M, r.start);
+    axes.forEach(x => { geo += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.1}" stroke-dasharray="${fs * 0.5} ${fs * 0.4}" opacity=".7"/>`; });
+    // cota dos montantes: distância de cada um até a extremidade esquerda do desenho -- referência física
+    // fixa (não depende de "esquerda/direita" de quem olha); na Face Interna, o desenho inteiro (linhas e
+    // montantes) é espelhado, e os números/rótulos abaixo acompanham via mx(), pra bater com o que se vê.
+    const dyM = H + mg * 0.42, tick = fs * 0.35;
+    geo += `<g stroke="var(--muted)" stroke-width="${fs * 0.06}" fill="var(--muted)">
+      <line x1="0" y1="${dyM}" x2="${W}" y2="${dyM}"/>
+      ${[0].concat(axes, [W]).map(x => `<line x1="${x}" y1="${dyM - tick}" x2="${x}" y2="${dyM + tick}"/>`).join('')}
+    </g>`;
+    axes.forEach(x => { texts += `<text x="${mx(x)}" y="${dyM + fs * 1.3}" text-anchor="middle" font-size="${fs * 0.6}" fill="var(--muted)">${fmtLen(x)}</text>`; });
+    studLeftover(W, M, r.start).forEach(lv => {
+      geo += `<rect x="${lv.from}" y="0" width="${lv.to - lv.from}" height="${H}" fill="var(--warn)" opacity=".1"/>`;
+      const lx = mx((lv.from + lv.to) / 2), side = mirror ? (lv.side === 'esquerda' ? 'direita' : 'esquerda') : lv.side;
+      texts += `<text x="${lx}" y="${dyM + fs * 2.3}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)">sobra da modulação: ${mm(lv.size)} mm (lado ${side})</text>`;
+    });
   }
-  s += texts;
   if (S.params.isClad){   // juntas do OSB (referência): o revestimento não pode alinhar com elas
     const av = avoidFor(S.params, wall.id);
     if (av){
-      av.v.forEach(o => { s += `<line x1="${o.x}" y1="${H - o.y0}" x2="${o.x}" y2="${H - o.y1}" stroke="var(--warn)" stroke-width="${fs * 0.14}" stroke-dasharray="${fs * 0.9} ${fs * 0.5}" opacity=".95"/>`; });
-      av.h.forEach(y => { s += `<line x1="0" y1="${H - y}" x2="${W}" y2="${H - y}" stroke="var(--warn)" stroke-width="${fs * 0.14}" stroke-dasharray="${fs * 0.9} ${fs * 0.5}" opacity=".95"/>`; });
+      av.v.forEach(o => { geo += `<line x1="${o.x}" y1="${H - o.y0}" x2="${o.x}" y2="${H - o.y1}" stroke="var(--warn)" stroke-width="${fs * 0.14}" stroke-dasharray="${fs * 0.9} ${fs * 0.5}" opacity=".95"/>`; });
+      av.h.forEach(y => { geo += `<line x1="0" y1="${H - y}" x2="${W}" y2="${H - y}" stroke="var(--warn)" stroke-width="${fs * 0.14}" stroke-dasharray="${fs * 0.9} ${fs * 0.5}" opacity=".95"/>`; });
     }
   }
   wall.openings.forEach(o => {
     const y = H - (o.y + o.h);
-    s += `<g><title>${esc(o.name)} (vão osso ${mm(o.w)} × ${mm(o.h)} mm)${o.margin > 0 ? ' · recuo das chapas: ' + mm(o.margin) + ' mm' : ''}</title>
-      <rect x="${o.x}" y="${y}" width="${o.w}" height="${o.h}" fill="url(#hatchW)" stroke="var(--accent)" stroke-width="${fs * 0.14}" stroke-dasharray="${fs * 0.6} ${fs * 0.3}"/></g>
-      <text x="${o.x + o.w / 2}" y="${y + o.h / 2 - fs * 0.5}" text-anchor="middle" font-size="${fs * 0.95}" font-weight="700" fill="var(--accent)" stroke="var(--panel)" stroke-width="${fs * 0.3}" paint-order="stroke">${esc(o.name)}</text>
-      <text x="${o.x + o.w / 2}" y="${y + o.h / 2 + fs * 0.7}" text-anchor="middle" font-size="${fs * 0.8}" fill="var(--accent)" stroke="var(--panel)" stroke-width="${fs * 0.3}" paint-order="stroke">${mm(o.w)} × ${mm(o.h)}</text>`;
+    geo += `<g><title>${esc(o.name)} (vão osso ${mm(o.w)} × ${mm(o.h)} mm)${o.margin > 0 ? ' · recuo das chapas: ' + mm(o.margin) + ' mm' : ''}</title>
+      <rect x="${o.x}" y="${y}" width="${o.w}" height="${o.h}" fill="url(#hatchW)" stroke="var(--accent)" stroke-width="${fs * 0.14}" stroke-dasharray="${fs * 0.6} ${fs * 0.3}"/></g>`;
+    const ocx = mx(o.x + o.w / 2);
+    texts += `<text x="${ocx}" y="${y + o.h / 2 - fs * 0.5}" text-anchor="middle" font-size="${fs * 0.95}" font-weight="700" fill="var(--accent)" stroke="var(--panel)" stroke-width="${fs * 0.3}" paint-order="stroke">${esc(o.name)}</text>
+      <text x="${ocx}" y="${y + o.h / 2 + fs * 0.7}" text-anchor="middle" font-size="${fs * 0.8}" fill="var(--accent)" stroke="var(--panel)" stroke-width="${fs * 0.3}" paint-order="stroke">${mm(o.w)} × ${mm(o.h)}</text>`;
   });
-  // cotas gerais
+  // cotas gerais (largura/altura totais) -- informação simétrica, não carrega lado; fica de fora do
+  // espelhamento, sempre na mesma moldura, nas duas faces.
   const dy = -mg * 0.45, dx = -mg * 0.45;
-  s += `<g stroke="var(--muted)" stroke-width="${fs * 0.08}" fill="var(--muted)">
+  const outer = `<g stroke="var(--muted)" stroke-width="${fs * 0.08}" fill="var(--muted)">
     <line x1="0" y1="${dy}" x2="${W}" y2="${dy}"/><line x1="0" y1="${dy - fs * 0.5}" x2="0" y2="${dy + fs * 0.5}"/><line x1="${W}" y1="${dy - fs * 0.5}" x2="${W}" y2="${dy + fs * 0.5}"/>
     <line x1="${dx}" y1="0" x2="${dx}" y2="${H}"/><line x1="${dx - fs * 0.5}" y1="0" x2="${dx + fs * 0.5}" y2="0"/><line x1="${dx - fs * 0.5}" y1="${H}" x2="${dx + fs * 0.5}" y2="${H}"/>
     <text x="${W / 2}" y="${dy - fs * 0.6}" text-anchor="middle" font-size="${fs * 1.1}" stroke="none">${fmtLen(W)}</text>
-    <text transform="translate(${dx - fs * 0.7} ${H / 2}) rotate(-90)" text-anchor="middle" font-size="${fs * 1.1}" stroke="none">${fmtLen(H)}</text></g></svg>`;
-  return s;
+    <text transform="translate(${dx - fs * 0.7} ${H / 2}) rotate(-90)" text-anchor="middle" font-size="${fs * 1.1}" stroke="none">${fmtLen(H)}</text></g>`;
+  const body = mirror ? `<g transform="translate(${W},0) scale(-1,1)">${geo}</g>` : geo;
+  return `<svg class="wallsvg" viewBox="${-mg} ${-mg} ${W + 2 * mg} ${H + 2 * mg}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
+    <defs><pattern id="hatchW" width="${fs * 0.9}" height="${fs * 0.9}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="${fs * 0.9}" height="${fs * 0.9}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 0.9}" stroke="var(--accent)" stroke-width="${fs * 0.1}"/></pattern></defs>
+    ${body}${texts}${outer}${mirror ? `<text x="${W / 2}" y="${-mg * 0.85}" text-anchor="middle" font-size="${fs * 0.85}" font-weight="700" fill="var(--accent)">VISTA ESPELHADA — de frente para a Face Interna</text>` : ''}</svg>`;
 }
 /* renderSheetCuttingPlan: plano de corte de uma chapa */
 function sheetAxes(r){
@@ -1534,7 +1619,18 @@ function panePlan(){
       <p class="hint" style="margin:0">Cada chapa mostra as peças (verde-água), as sobras reaproveitáveis (verde), os resíduos (cinza) e os cortes em vermelho tracejado. O número da peça é o mesmo usado na vista da parede (chapa.peça).</p>
       <button class="btn ghost sm" style="margin-left:auto;white-space:nowrap" data-act3="gcodeall" data-layer="${CUR_LAYER}" ${anyCuts ? '' : 'disabled'}>⬇ Baixar tudo (.zip)</button>
     </div>
+  ${S.params.cncEngrave ? engraveInstallNote() : ''}
   <div class="sheet-grid">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>${legend()}`;
+}
+// Regra de instalação da face gravada: o desenho abaixo mostra a peça exatamente como ela fica na
+// mesa da CNC (face gravada "pra cima") -- o app não sabe nem controla qual face física vai ficar
+// visível depois de pronta, isso é decidido na hora de montar (pra qual lado a chapa é virada). Por
+// pedido do Carlos, a face gravada deve SEMPRE ficar voltada para o lado visível (fachada/ambiente),
+// nos dois lados de uma parede de duas faces -- nunca escondida contra o montante. Isso não exige
+// nenhuma mudança na geometria/corte (o desenho já representa a face gravada, que é a face visível
+// depois de instalada); é só a regra de montagem que precisa ficar explícita pro operador.
+function engraveInstallNote(){
+  return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante. Vale para as duas faces de uma parede de duas faces.</div>`;
 }
 function sheetCard(s, r){
   const used = s.placed.reduce((a, p) => a + plArea(p), 0), tot = r.sw * r.sh, { W, H, mdim } = sheetAxes(r);
@@ -1562,7 +1658,7 @@ function paneList(){
 function paneRes(){
   const r = R.sel.r, m = r.metrics;
   const rows = r.sheets.map(s => { const used = s.placed.reduce((a, p) => a + plArea(p), 0); return `<tr><td>${s.no}</td><td>${s.kind === 'whole' && !s.trimmed ? 'Inteira' : s.kind === 'whole' ? 'Inteira c/ ajuste' : 'Cortada'}</td><td class="n">${fmtA4(m.sheetArea)}</td><td class="n">${fmtA4(used)}</td><td class="n">${fmtA4(m.sheetArea - used)}</td><td class="n">${fmtP(used / m.sheetArea * 100)}</td><td class="n">${s.cuts}</td></tr>`; }).join('');
-  const wallRows = r.entries.map(e => { const pc = e.lay.pieces, area = pc.reduce((a, p) => a + pieceArea(p), 0); return `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${fmtA(openingsArea(e.wall))}</td><td class="n">${fmtA(area)}</td><td class="n">${pc.filter(p => p.whole).length}</td><td class="n">${pc.filter(p => !p.whole).length}</td></tr>`; }).join('');
+  const wallRows = r.entries.map(e => { const pc = e.lay.pieces, area = pc.reduce((a, p) => a + pieceArea(p), 0); return `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${fmtA(openingsArea(e.wall))}</td><td class="n">${fmtA(area)}</td><td class="n">${pc.filter(p => p.whole).length}</td><td class="n">${pc.filter(p => !p.whole).length}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`; }).join('');
   return `<div class="two">
     <div><h3 style="margin-bottom:6px">Balanço de áreas</h3><table class="bal"><tbody>
       <tr><td>Área da parede (bruta)</td><td class="n">${fmtA(m.gross)}</td></tr>
@@ -1588,7 +1684,7 @@ function paneRes(){
       ${m.remnants.length ? `<h3 style="margin:14px 0 6px">Sobras reaproveitáveis</h3><table><thead><tr><th>Chapa</th><th class="n">Dimensão (mm)</th><th class="n">Área</th></tr></thead><tbody>${m.remnants.map(x => `<tr><td>${x.sheet}</td><td class="n">${mm(x.w)} × ${mm(x.h)}</td><td class="n">${fmtA4(x.w * x.h)}</td></tr>`).join('')}</tbody></table>` : ''}</div></div>
     <h3 style="margin:18px 0 6px">Por chapa</h3><div class="tbl-wrap"><table><thead><tr><th>Chapa</th><th>Tipo</th><th class="n">Área da chapa</th><th class="n">Área utilizada</th><th class="n">Área sobra</th><th class="n">Aproveitamento</th><th class="n">Cortes</th></tr></thead><tbody>${rows}
       <tr class="tot"><td colspan="2">Total</td><td class="n">${fmtA4(m.nominal)}</td><td class="n">${fmtA4(m.pieceArea)}</td><td class="n">${fmtA4(m.waste)}</td><td class="n">${fmtP(m.util)}</td><td class="n">${m.cuts}</td></tr></tbody></table></div>
-    <h3 style="margin:18px 0 6px">Por parede</h3><div class="tbl-wrap"><table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área coberta</th><th class="n">Chapas inteiras</th><th class="n">Peças cortadas</th></tr></thead><tbody>${wallRows}</tbody></table></div>`;
+    <h3 style="margin:18px 0 6px">Por parede</h3><div class="tbl-wrap"><table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área coberta</th><th class="n">Chapas inteiras</th><th class="n">Peças cortadas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>${wallRows}</tbody></table></div>`;
 }
 function paneCmp(){
   const ordered = R.alts.slice();
@@ -1939,8 +2035,8 @@ function generateReport(){
   return `<div class="rep">
     <h1>${esc(S.name)}</h1><div class="meta">Relatório de paginação de chapas${P.isClad ? ' — REVESTIMENTO sobre o OSB' : ''} · ${date}</div>
     <h2>Dados do projeto</h2>
-    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Desenc. mín. juntas</th></tr></thead><tbody>
-      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td></tr>`).join('')}</tbody></table>
+    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Desenc. mín. juntas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>
+      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`).join('')}</tbody></table>
     <h2>Material e montagem</h2>
     <table><tbody>
       <tr><td>Chapa</td><td>${esc(R.mat.name)} (${esc(R.mat.type)}) · ${mm(R.mat.w)} × ${mm(R.mat.h)} mm · espessura ${fmtNum(R.mat.t, 1)} mm</td></tr>
@@ -1962,7 +2058,9 @@ function generateReport(){
     <p>Chapas inteiras sem corte: <b>${m.nWholeClean}</b> (${mm(r.sw)} × ${mm(r.sh)} mm).</p>
     <h2>Corte chapa por chapa</h2>
     <table><thead><tr><th>Chapa</th><th>Peças</th><th class="n">Cortes</th></tr></thead><tbody>${r.sheets.map(s => `<tr><td>${s.no}</td><td style="white-space:normal">${s.kind === 'whole' && !s.trimmed ? 'Inteira, sem corte' : s.placed.map(pl => { const [dw, dh] = mdim(pl.w, pl.h); return esc(pl.piece.label) + ': ' + mm(dw) + '×' + mm(dh) + (pl.rot ? ' (girada)' : ''); }).join(' · ')}</td><td class="n">${s.cuts}</td></tr>`).join('')}</tbody></table>
-    <h2>Planos de corte</h2><div class="sheets">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>
+    <h2>Planos de corte</h2>
+    ${P.cncEngrave ? engraveInstallNote() : ''}
+    <div class="sheets">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>
     <div class="footer-rights" style="margin-top:14px">Desenvolvido por Carlos Hoff - Todos os direitos reservados.</div>
   </div>`;
 }
@@ -2826,45 +2924,57 @@ document.addEventListener('change', e => {
 const PDFC = { whole: [221, 184, 119], cut: [147, 199, 187], remn: [191, 227, 196], resid: [217, 223, 225], ink: [18, 38, 44], mut: [88, 108, 114], acc: [11, 92, 173], red: [179, 38, 30], line: [205, 215, 218] };
 function pdfWall(doc, x, y, boxW, boxH, ent, r){
   const W = ent.wall.w, H = ent.wall.h, k = Math.min((boxW - 14) / W, (boxH - 8) / H), ox = x + 12, oy = y + 4;
+  // Mesmo espelhamento da vista em tela (ver renderWall): Face Interna desenhada invertida, pra bater com
+  // o que o montador vê de pé na frente dela -- os dados (posição de peça/montante) continuam intactos,
+  // só a posição X na página muda. mX() dá a coordenada X já em pts, de um retângulo (passe a largura
+  // local lw) ou de um ponto/linha (lw=0); mC() faz o mesmo pra um X de CENTRO (usado em texto).
+  const mirror = ent.wall.face === 'int';
+  const mX = (lx, lw) => ox + (mirror ? (W - lx - (lw || 0)) : lx) * k;
+  const mC = cx => ox + (mirror ? (W - cx) : cx) * k;
   doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.3); doc.setFillColor(255, 255, 255); doc.rect(ox, oy, W * k, H * k, 'FD');
   ent.lay.pieces.forEach(p => {
     const rs = pieceRects(p);
     doc.setFillColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.15);
     if (p.body){
-      rs.forEach(b => { doc.setDrawColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.rect(ox + b.x * k, oy + (H - b.y - b.h) * k, b.w * k, b.h * k, 'FD'); });
+      rs.forEach(b => { doc.setDrawColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.rect(mX(b.x, b.w), oy + (H - b.y - b.h) * k, b.w * k, b.h * k, 'FD'); });
       doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.2);
-      mergeCutSegs(unionOutline(rs), 0.01).forEach(c => doc.line(ox + c.x1 * k, oy + (H - c.y1) * k, ox + c.x2 * k, oy + (H - c.y2) * k));
-    } else doc.rect(ox + p.x * k, oy + (H - p.y - p.h) * k, p.w * k, p.h * k, 'FD');
+      mergeCutSegs(unionOutline(rs), 0.01).forEach(c => doc.line(mX(c.x1, 0), oy + (H - c.y1) * k, mX(c.x2, 0), oy + (H - c.y2) * k));
+    } else doc.rect(mX(p.x, p.w), oy + (H - p.y - p.h) * k, p.w * k, p.h * k, 'FD');
   });
   if (S.params.showStuds && S.params.studs > 0){
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.15); doc.setLineDashPattern([1.2, 1], 0);
-    studAxes(W, S.params.studs, r.start).forEach(sx => doc.line(ox + sx * k, oy, ox + sx * k, oy + H * k)); doc.setLineDashPattern([], 0);
+    studAxes(W, S.params.studs, r.start).forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k)); doc.setLineDashPattern([], 0);
   }
   if (S.params.isClad){
     const av = avoidFor(S.params, ent.wall.id);
     if (av){
       doc.setDrawColor(200, 120, 0); doc.setLineWidth(0.3); doc.setLineDashPattern([1.6, 1.2], 0);
-      av.v.forEach(o => doc.line(ox + o.x * k, oy + (H - o.y0) * k, ox + o.x * k, oy + (H - o.y1) * k));
+      av.v.forEach(o => doc.line(mX(o.x, 0), oy + (H - o.y0) * k, mX(o.x, 0), oy + (H - o.y1) * k));
       av.h.forEach(y => doc.line(ox, oy + (H - y) * k, ox + W * k, oy + (H - y) * k));
       doc.setLineDashPattern([], 0);
     }
   }
   ent.lay.pieces.forEach(p => {
-    const lb = biggestRect(pieceRects(p)), px = ox + lb.x * k, py = oy + (H - lb.y - lb.h) * k, pw = lb.w * k, ph = lb.h * k;
+    const lb = biggestRect(pieceRects(p)), pcx = mC(lb.x + lb.w / 2), py = oy + (H - lb.y - lb.h) * k, pw = lb.w * k, ph = lb.h * k;
     doc.setTextColor(...PDFC.ink);
     if (pw > 9 && ph > 5){
-      doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(8, pw / 3.4 + 2)); doc.text(String(p.label) + (p.shape ? ' (' + shapeTag(p.shape) + ')' : ''), px + pw / 2, py + ph / 2 - (ph > 12 ? 1 : -1), { align: 'center' });
-      if (ph > 12 && pw > 16){ doc.setFont('helvetica', 'normal'); doc.setFontSize(Math.min(6.5, pw / 4 + 1.5)); doc.text(mm(p.w) + ' x ' + mm(p.h), px + pw / 2, py + ph / 2 + 3, { align: 'center' }); }
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(8, pw / 3.4 + 2)); doc.text(String(p.label) + (p.shape ? ' (' + shapeTag(p.shape) + ')' : ''), pcx, py + ph / 2 - (ph > 12 ? 1 : -1), { align: 'center' });
+      if (ph > 12 && pw > 16){ doc.setFont('helvetica', 'normal'); doc.setFontSize(Math.min(6.5, pw / 4 + 1.5)); doc.text(mm(p.w) + ' x ' + mm(p.h), pcx, py + ph / 2 + 3, { align: 'center' }); }
     }
   });
   ent.wall.openings.forEach(o => {
-    const px = ox + o.x * k, py = oy + (H - o.y - o.h) * k;
+    const px = mX(o.x, o.w), py = oy + (H - o.y - o.h) * k;
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.4); doc.setLineDashPattern([2, 1], 0); doc.setFillColor(255, 255, 255); doc.rect(px, py, o.w * k, o.h * k, 'FD'); doc.setLineDashPattern([], 0);
-    doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.text(String(o.name), px + o.w * k / 2, py + o.h * k / 2, { align: 'center' });
+    doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.text(String(o.name), mC(o.x + o.w / 2), py + o.h * k / 2, { align: 'center' });
   });
   doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5);
   doc.text(mm(W) + ' mm', ox + W * k / 2, oy - 1, { align: 'center' });
   doc.text(mm(H) + ' mm', ox - 2, oy + H * k / 2, { align: 'center', angle: 90 });
+  if (mirror){
+    doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(7.5);
+    doc.text('VISTA ESPELHADA — de frente para a Face Interna', ox + W * k / 2, oy + H * k + 4, { align: 'center' });
+    return oy + H * k + 5;
+  }
   return oy + H * k;
 }
 function pdfSheet(doc, x, y, boxW, boxH, s, r){
@@ -2933,8 +3043,8 @@ function buildPDF(){
     ['Folga do piso + juntas', fmtA(m.floorArea + m.jointArea), 'Sobra reaproveitável', fmtA(m.reusableArea)], ['Recuo ao redor das aberturas', fmtA(m.marginArea), 'Resíduo', fmtA(m.residueArea)],
     ['Aproveitamento (útil/comprada)', fmtP(m.util), 'Desperdício', fmtP(m.wastePct)], ['Parede bruta / comprada', fmtP(m.wallOverNominal), '', '']], [0, 52, 96, 140]);
   h2('Paredes');
-  table([{ t: 'Parede', w: 32 }, { t: 'Dimensões (mm)', w: 36, a: 'r' }, { t: 'Área bruta', w: 26, a: 'r' }, { t: 'Aberturas', w: 26, a: 'r' }, { t: 'Inteiras', w: 18, a: 'r' }, { t: 'Cortadas', w: 24, a: 'r' }, { t: 'Desenc. juntas', w: 24, a: 'r' }],
-    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-']));
+  table([{ t: 'Parede', w: 30 }, { t: 'Dimensões (mm)', w: 30, a: 'r' }, { t: 'Área bruta', w: 24, a: 'r' }, { t: 'Aberturas', w: 22, a: 'r' }, { t: 'Inteiras', w: 16, a: 'r' }, { t: 'Cortadas', w: 20, a: 'r' }, { t: 'Desenc. juntas', w: 20, a: 'r' }, { t: 'Sobra modulação', w: 24, a: 'r' }],
+    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-', leftoverLabel(e.wall, r)]));
   // paginação de cada parede
   r.entries.forEach(e => {
     const ratio = e.wall.h / e.wall.w, boxW = PW - 2 * M, boxH = Math.min(118, Math.max(60, boxW * ratio));
@@ -2953,7 +3063,14 @@ function buildPDF(){
   table([{ t: 'Chapa', w: 18 }, { t: 'Peças (largura x altura, mm)', w: 146 }, { t: 'Cortes', w: 22, a: 'r' }],
     r.sheets.map(s => [s.no, s.kind === 'whole' && !s.trimmed ? 'Inteira, sem corte' : s.placed.map(pl => { const [dw, dh] = mdimPdf(pl.w, pl.h); return pl.piece.label + ': ' + mm(dw) + 'x' + mm(dh) + (pl.rot ? ' (girada)' : ''); }).join('   '), s.cuts]));
   // planos de corte (3 por linha)
-  newPage(); h2('Planos de corte por chapa'); doc.setFontSize(8); doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.text('Tracejado vermelho = corte. Numeração das peças: chapa.peça (igual à vista da parede).', M, y); y += 6;
+  newPage(); h2('Planos de corte por chapa'); doc.setFontSize(8); doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.text('Tracejado vermelho = corte. Numeração das peças: chapa.peça (igual à vista da parede).', M, y); y += 4.5;
+  if (P.cncEngrave){
+    need(5); doc.setFont('helvetica', 'bold'); doc.setTextColor(...PDFC.ink); doc.text('Regra de instalação:', M, y); y += 3.6;
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(...PDFC.mut);
+    const noteLines = doc.splitTextToSize('Monte sempre com a face GRAVADA (a destes desenhos) voltada para o lado visível (fachada/ambiente, conforme a face) — a face sem gravação fica encostada no montante.', PW - 2 * M);
+    need(noteLines.length * 3.6); doc.text(noteLines, M, y); y += noteLines.length * 3.6;
+  }
+  y += 1.5;
   const cellW = (PW - 2 * M - 12) / 3, cellH = 96; let col = 0, rowTop = y;
   r.sheets.forEach(s => {
     if (col === 0 && rowTop + cellH + 10 > 285){ newPage(); rowTop = y; }
