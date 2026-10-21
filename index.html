@@ -1558,16 +1558,27 @@ function sheetAxes(r){
   const T = r.sw > r.sh;      // true = o encaixe usou a chapa "deitada" (sw é a maior medida)
   const W = T ? r.sh : r.sw;  // extensão no eixo X do desenho / da máquina (a menor medida da chapa)
   const H = T ? r.sw : r.sh;  // extensão no eixo Y do desenho / da máquina (a maior medida da chapa)
-  // Coordenadas da MÁQUINA (as que vão para o G-code): direto, sem inverter — o canto (0,0) do
-  // encaixe é o mesmo canto (0,0) da máquina, sem nenhuma transformação além da troca de eixo quando
-  // a chapa está deitada. É ESSENCIAL não inverter aqui: o valor gravado no arquivo precisa
-  // corresponder exatamente ao canto onde a chapa é zerada na mesa.
-  const mpt = (x, y) => T ? [y, x] : [x, y];
+  // Coordenadas da MÁQUINA (as que vão para o G-code): quando a chapa está deitada, a peça (desenhada/
+  // encaixada no referencial x=largura da parede, y=altura da parede) precisa girar 90° pra caber com a
+  // medida menor da chapa no eixo X da mesa. IMPORTANTE: a troca ingênua (x,y)->(y,x) NÃO é uma rotação
+  // de 90°, é um ESPELHAMENTO (reflexão em torno da diagonal) -- confirmado tanto por determinante
+  // (matriz [[0,1],[1,0]], determinante -1) quanto testando ao vivo: o recorte de uma peça em L/U perto
+  // de abertura saía com a "mão" trocada entre o Plano de corte e a Vista da parede (reportado pelo
+  // Carlos: "terei que tombar a peça" pra instalar, o que vira a gravação pro lado do montante). A
+  // rotação de 90° de verdade (sentido horário, preservando a geometria) é (x,y) -> (W-y, x) -- essa SIM
+  // tem determinante +1. Corrigido aqui; por tabela, o "mirrorFix" que existia em pieceEngraveCuts (pra
+  // compensar esse espelhamento só no texto gravado, sem corrigir o corte/G-code de verdade) deixou de
+  // ser necessário e foi removido -- ver pieceEngraveCuts.
+  const mpt = (x, y) => T ? [W - y, x] : [x, y];
   // Coordenadas de TELA (só para o desenho SVG/PDF): mesmo X, Y invertido para o desenho ficar com
   // "0" embaixo (convenção visual, Y crescendo para cima) — essa inversão NUNCA deve ser usada para
   // gerar o G-code, só para posicionar os elementos no desenho.
   const spt = (x, y) => { const [mx, my] = mpt(x, y); return [mx, H - my]; };
-  const srect = (x, y, w, h) => { const [mx, my] = mpt(x, y); const mw = T ? h : w, mh = T ? w : h; return { x: mx, y: H - my - mh, w: mw, h: mh }; };
+  // Retângulo transformado: não dá pra só chamar mpt(x,y) e usar o resultado como canto (x,y) da caixa --
+  // com a rotação de 90°, o canto da NOVA caixa (mínimo em cada eixo) vem de um canto DIFERENTE da caixa
+  // original (ver mpt(x,y+h) abaixo, não mpt(x,y)); resolvido direto por fórmula, já testado contra o
+  // desenho real das duas telas (Vista da parede x Plano de corte) pra confirmar que batem por rotação.
+  const srect = (x, y, w, h) => T ? { x: W - y - h, y: H - x - w, w: h, h: w } : { x, y: H - y - h, w, h };
   const mdim = (w, h) => T ? [h, w] : [w, h];   // largura/altura de uma peça, já na convenção da máquina
   return { T, W, H, mpt, spt, srect, mdim };
 }
@@ -2171,15 +2182,6 @@ const ENGRAVE_MARGIN = 6;
 // nela). Gira o texto 90° quando a peça é mais alta que larga (tira estreita), para acompanhar o lado
 // maior. Cada polilinha devolvida já é um traço contínuo (ver comentário da fonte acima).
 //
-// `mirrorFix`: quando a chapa precisa ser usada "deitada" na mesa (T de sheetAxes), mpt() troca os
-// eixos — (x,y) vira (y,x) — para que a menor medida da chapa fique no X da máquina. Essa troca de
-// eixos é um ESPELHAMENTO (determinante negativo), não uma rotação: para linhas de corte isso não
-// importa (um segmento reto fica igual, só muda de posição), mas para o TEXTO da gravação isso
-// inverte a letra (fica de trás para frente, como visto no espelho). Para uma peça/caractere sem
-// essa inversão não importa a ordem dos pontos, mas quando `mirrorFix` é true, espelhamos aqui o
-// deslocamento local em X ANTES de devolver os pontos — assim, quando mpt() aplicar sua própria
-// troca de eixos lá fora, as duas inversões se cancelam e o resultado final é uma ROTAÇÃO (texto
-// gira com a peça, mas continua legível), em vez de um espelhamento.
 // Numa peça com recorte (formato L/U/moldura, contornando uma abertura — ver pl.body/pl.voids em
 // placePiece), a caixa cheia (pl.x,y,w,h) inclui a área VAZIA do vão, que é removida/descartada — não
 // é material de verdade. Gravar centralizado nessa caixa cheia, sem olhar pra isso, pode colocar a
@@ -2191,7 +2193,7 @@ function engraveTargetRect(pl){
   if (!pl.body || !pl.body.length) return { x: pl.x, y: pl.y, w: pl.w, h: pl.h };
   return pl.body.reduce((best, r) => (!best || r.w * r.h > best.w * best.h) ? r : best, null);
 }
-function pieceEngraveCuts(pl, text, heightMM, mirrorFix){
+function pieceEngraveCuts(pl, text, heightMM){
   const raw = normalizeEngraveText(text);
   if (!raw) return [];
   const { origins, widthUnits } = glyphOrigins(raw);
@@ -2208,7 +2210,6 @@ function pieceEngraveCuts(pl, text, heightMM, mirrorFix){
       const pts = stroke.map(([gx, gy]) => {
         let px = startX + (x + gx) * s, py = (gy - FONT_GRID_H / 2) * s;
         if (rotate){ const t = px; px = -py; py = t; }
-        if (mirrorFix) px = -px;
         return { x: cx + px, y: cy + py };
       });
       if (pts.length >= 2) paths.push(pts);
@@ -2471,7 +2472,7 @@ function sheetToolpath(sheet, r){
     if (trimLines.length){ allCuts = trimLines.concat(ordered); trimmed = true; }
   }
   let engrave = [];
-  if (P.cncEngrave) sheet.placed.forEach(pl => { engrave = engrave.concat(orderPaths(pieceEngraveCuts(pl, pl.piece.label, P.cncEngraveHeight, T), mpt)); });
+  if (P.cncEngrave) sheet.placed.forEach(pl => { engrave = engrave.concat(orderPaths(pieceEngraveCuts(pl, pl.piece.label, P.cncEngraveHeight), mpt)); });
   const strokes = buildStrokes(allCuts, passes, step, P, engrave);
   return { P, mat, total, passes, step, tool, T, W, H, rawW, rawH, trimmed, strokes };
 }
@@ -2506,7 +2507,7 @@ function pieceToolpath(sheet, r, pieceLabel){
   const [pdw, pdh] = pl ? mdim(pl.w, pl.h) : [0, 0];
   const cuts = cutsForPiece(sheet, pieceLabel, P.kerf, r.sw, r.sh);
   const ordered = orderCuts(cuts, mpt);
-  const engraveM = P.cncEngrave && pl ? orderPaths(pieceEngraveCuts(pl, pieceLabel, P.cncEngraveHeight, T), mpt) : [];
+  const engraveM = P.cncEngrave && pl ? orderPaths(pieceEngraveCuts(pl, pieceLabel, P.cncEngraveHeight), mpt) : [];
   // Desloca tudo para uma origem própria (canto do material que sobra a peça, não o da chapa
   // inteira) — assim dá para usar só uma sobra menor, alinhada nesse canto, em vez da chapa toda.
   let minX = Infinity, minY = Infinity;
