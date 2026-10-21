@@ -1470,6 +1470,20 @@ function fsFit(text, fs, w){ return text.length * fs * 0.56 <= w; }
 /* Retângulos {x,y,w,h} (coords da parede) que formam uma peça; e a caixa onde vai o texto (maior retângulo). */
 function pieceRects(p){ return p.body ? p.body.map(b => ({ x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0 })) : [{ x: p.x, y: p.y, w: p.w, h: p.h }]; }
 function biggestRect(rs){ return rs.reduce((a, b) => (b.w * b.h > a.w * a.h ? b : a)); }
+/* Vista espelhada (Face Interna): a peça continua aparecendo do lado oposto da parede (isso é físico --
+   olhar a parede do lado de dentro troca esquerda/direita -- e já estava certo, o Carlos confirmou). O
+   que NÃO pode acontecer é o RECORTE dentro da peça também inverter: o corte que sai da CNC é idêntico
+   nas duas faces (ver solve()/cutPieces), e a operação de instalação só pode ser rotação, nunca espelho
+   (pedido explícito do Carlos, depois de reportar que a peça 3.1 saía "tombada" -- gravação pro lado do
+   montante). Então, em vez de espelhar cada retângulo da peça em torno do centro da PAREDE (W/2), a gente
+   desloca o conjunto inteiro (translação rígida, preservando a forma) até a posição em que a peça ficaria
+   se fosse espelhada -- sem espelhar o que está DENTRO dela. Pra uma peça sem recorte (um retângulo só)
+   dá exatamente o mesmo resultado do espelho de ponto normal (não muda nada visualmente).
+   shiftX(x) = nova posição X final (mesma convenção de mX/mC: ponto já na posição espelhada da peça). */
+function mirrorShiftX(rects, W){
+  const bx0 = Math.min(...rects.map(b => b.x)), bw = Math.max(...rects.map(b => b.x + b.w)) - bx0;
+  return x => (x - bx0) + (W - bx0 - bw);
+}
 function shapeTag(sh){ return sh === 'L' ? 'em L' : sh === 'U' ? 'em U' : sh === 'moldura' ? 'moldura' : sh ? 'c/ recortes' : ''; }
 /* renderWall: vista da parede, proporcional às medidas reais */
 function renderWall(entry, r, opts){
@@ -1490,13 +1504,21 @@ function renderWall(entry, r, opts){
   let texts = '';
   lay.pieces.forEach(p => {
     const rects = pieceRects(p), fill = p.whole ? 'var(--whole)' : 'var(--cut)', lb = biggestRect(rects), tag = shapeTag(p.shape);
+    // Na Face Interna, a peça continua indo pro lado espelhado (shiftX), mas o recorte dentro dela não
+    // pode virar -- ver mirrorShiftX() acima. lx/lxr dão a coordenada LOCAL (antes do <g transform>
+    // espelhar tudo de novo lá embaixo) que faz o retângulo/ponto terminar na posição deslocada-sem-
+    // espelhar-por-dentro depois do transform aplicar a reflexão de novo. Pra peça sem recorte dá o
+    // mesmo resultado de sempre (não muda nada visualmente).
+    const shiftX = mirror ? mirrorShiftX(rects, W) : null;
+    const lx = x => shiftX ? W - shiftX(x) : x;
+    const lxr = (x, w) => shiftX ? W - shiftX(x) - w : x;
     geo += `<g><title>Chapa ${p.label}${p.whole ? ' (inteira)' : ' (peça cortada' + (p.shapeDesc ? ' · ' + p.shapeDesc : '') + ')'} · ${mm(p.w)} × ${mm(p.h)} mm</title>`;
     if (p.body){
-      rects.forEach(b => { geo += `<rect x="${b.x}" y="${H - (b.y + b.h)}" width="${b.w}" height="${b.h}" fill="${fill}" stroke="${fill}" stroke-width="${fs * 0.03}"/>`; });
-      geo += `<path d="${mergeCutSegs(unionOutline(rects), 0.01).map(c => `M${c.x1} ${H - c.y1}L${c.x2} ${H - c.y2}`).join('')}" fill="none" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
-    } else geo += `<rect x="${p.x}" y="${H - (p.y + p.h)}" width="${p.w}" height="${p.h}" fill="${fill}" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
+      rects.forEach(b => { geo += `<rect x="${lxr(b.x, b.w)}" y="${H - (b.y + b.h)}" width="${b.w}" height="${b.h}" fill="${fill}" stroke="${fill}" stroke-width="${fs * 0.03}"/>`; });
+      geo += `<path d="${mergeCutSegs(unionOutline(rects), 0.01).map(c => `M${lx(c.x1)} ${H - c.y1}L${lx(c.x2)} ${H - c.y2}`).join('')}" fill="none" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
+    } else geo += `<rect x="${lxr(p.x, p.w)}" y="${H - (p.y + p.h)}" width="${p.w}" height="${p.h}" fill="${fill}" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
     geo += '</g>';
-    const cx = mx(lb.x + lb.w / 2), cy = H - (lb.y + lb.h) + lb.h / 2, l1 = 'Chapa ' + p.label, l2 = mm(p.w) + ' × ' + mm(p.h), l3 = p.whole ? 'inteira' : (tag ? 'cortada ' + tag : 'cortada');
+    const cx = shiftX ? shiftX(lb.x + lb.w / 2) : lb.x + lb.w / 2, cy = H - (lb.y + lb.h) + lb.h / 2, l1 = 'Chapa ' + p.label, l2 = mm(p.w) + ' × ' + mm(p.h), l3 = p.whole ? 'inteira' : (tag ? 'cortada ' + tag : 'cortada');
     if (lb.w > fs * 2 && lb.h > fs * 1.4){
       const small = !fsFit(l1, fs, lb.w) ? fs * 0.7 : fs;
       texts += `<text x="${cx}" y="${cy - (lb.h > fs * 4 ? fs * 0.7 : 0)}" text-anchor="middle" dominant-baseline="middle" font-size="${small}" font-weight="700" fill="var(--ink)" stroke="var(--panel)" stroke-width="${fs * 0.02}">${l1.replace('Chapa ', lb.w < fs * 5 ? '' : 'Chapa ')}</text>`;
@@ -2937,12 +2959,16 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
   doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.3); doc.setFillColor(255, 255, 255); doc.rect(ox, oy, W * k, H * k, 'FD');
   ent.lay.pieces.forEach(p => {
     const rs = pieceRects(p);
+    // Mesma lógica de mirrorShiftX usada no SVG (renderWall): a peça vai pro lado espelhado, mas o
+    // recorte dentro dela não inverte -- psX() dá a posição final já deslocada (sem espelho interno).
+    const shiftX = mirror ? mirrorShiftX(rs, W) : null;
+    const psX = lx => ox + (shiftX ? shiftX(lx) : lx) * k;
     doc.setFillColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.15);
     if (p.body){
-      rs.forEach(b => { doc.setDrawColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.rect(mX(b.x, b.w), oy + (H - b.y - b.h) * k, b.w * k, b.h * k, 'FD'); });
+      rs.forEach(b => { doc.setDrawColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.rect(psX(b.x), oy + (H - b.y - b.h) * k, b.w * k, b.h * k, 'FD'); });
       doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.2);
-      mergeCutSegs(unionOutline(rs), 0.01).forEach(c => doc.line(mX(c.x1, 0), oy + (H - c.y1) * k, mX(c.x2, 0), oy + (H - c.y2) * k));
-    } else doc.rect(mX(p.x, p.w), oy + (H - p.y - p.h) * k, p.w * k, p.h * k, 'FD');
+      mergeCutSegs(unionOutline(rs), 0.01).forEach(c => doc.line(psX(c.x1), oy + (H - c.y1) * k, psX(c.x2), oy + (H - c.y2) * k));
+    } else doc.rect(psX(p.x), oy + (H - p.y - p.h) * k, p.w * k, p.h * k, 'FD');
   });
   if (S.params.showStuds && S.params.studs > 0){
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.15); doc.setLineDashPattern([1.2, 1], 0);
@@ -2958,7 +2984,8 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
     }
   }
   ent.lay.pieces.forEach(p => {
-    const lb = biggestRect(pieceRects(p)), pcx = mC(lb.x + lb.w / 2), py = oy + (H - lb.y - lb.h) * k, pw = lb.w * k, ph = lb.h * k;
+    const rs = pieceRects(p), shiftX = mirror ? mirrorShiftX(rs, W) : null;
+    const lb = biggestRect(rs), pcx = ox + (shiftX ? shiftX(lb.x + lb.w / 2) : lb.x + lb.w / 2) * k, py = oy + (H - lb.y - lb.h) * k, pw = lb.w * k, ph = lb.h * k;
     doc.setTextColor(...PDFC.ink);
     if (pw > 9 && ph > 5){
       doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(8, pw / 3.4 + 2)); doc.text(String(p.label) + (p.shape ? ' (' + shapeTag(p.shape) + ')' : ''), pcx, py + ph / 2 - (ph > 12 ? 1 : -1), { align: 'center' });
