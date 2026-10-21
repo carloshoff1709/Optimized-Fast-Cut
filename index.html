@@ -803,22 +803,6 @@ function faceWall(wall, face){
 function cloneLayForFace(lay, faceW){
   return Object.assign({}, lay, { pieces: lay.pieces.map(p => Object.assign({}, p, { wallId: faceW.id, wallName: faceW.name })) });
 }
-/* Gravação "sempre à vista" em peça com recorte (vão de porta/janela) na Face Interna: virar a chapa pra
-   trocar qual face fica gravada-pra-fora espelha esquerda/direita (é a mesma rotação 3D explicada ao
-   Carlos -- virar sem derrubar mantém "cima" no lugar, e isso OBRIGA a inverter o outro eixo). Então, se o
-   corte da Face Interna fosse feito igual ao da Externa, ao montar virada (gravação à vista) o recorte cai
-   do lado ERRADO do vão. A correção é só no CORTE: espelhamos o recorte dentro da própria peça (em volta do
-   seu centro), sem alterar onde a peça fica na parede (x/largura da peça continuam os mesmos -- a junta
-   continua caindo no mesmo montante real nas duas faces). A Vista da Parede (puramente visual, em renderWall)
-   já espelha a Face Interna inteira por um caminho separado e não usa esta função -- os dois espelhamentos
-   não se combinam porque atuam em cópias diferentes da peça (ver uso em solve()).                        */
-function mirrorPieceLocal(p){
-  if (!p.voids || !p.voids.length) return p;
-  const cx = p.x + p.w / 2, mirrorR = r => ({ x0: 2 * cx - r.x1, x1: 2 * cx - r.x0, y0: r.y0, y1: r.y1 });
-  const voids = p.voids.map(mirrorR), body = p.body.map(mirrorR);
-  const d = describeShape({ x0: p.x, x1: p.x + p.w, y0: p.y, y1: p.y + p.h }, voids);
-  return Object.assign({}, p, { body, voids, shape: d.shape, shapeDesc: d.desc, __orig: p });
-}
 /* ---------- 4) solução completa para uma combinação (orientação + início) ---------- */
 function solve(S, mat, orient, start, effort){
   const P = S.params;
@@ -858,10 +842,9 @@ function solve(S, mat, orient, start, effort){
     if (trimH){ cutLines.push({ x1: 0, y1: p.h + P.kerf / 2, x2: sw, y2: p.h + P.kerf / 2 }); cuts++; kerfArea += sw * P.kerf; }
     sheets.push({ kind: 'whole', trimmed: trimW || trimH, placed: [{ x: 0, y: 0, w: p.w, h: p.h, rot: false, piece: p }], free: [], cutLines, cuts, kerfArea });
   }));
-  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). Na Face Interna, manda pro
-  // corte uma cópia com o recorte espelhado (mirrorPieceLocal) -- é peça "whole" nunca tem recorte, então
-  // só entra aqui; a Vista da Parede continua lendo a peça original (não-espelhada) em e.lay.pieces.
-  const cutPieces = e => e.lay.pieces.filter(p => !p.whole).map(p => e.wall.face === 'int' ? mirrorPieceLocal(p) : p);
+  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). As duas faces usam a MESMA
+  // peça (mesmo recorte, mesma posição) -- corte idêntico nas duas, só rotação é permitida na operação.
+  const cutPieces = e => e.lay.pieces.filter(p => !p.whole);
   const pools = P.share ? [entries.flatMap(cutPieces)] : entries.map(cutPieces);
   for (const pool of pools){
     const packed = optimizeLayout(pool, sw, sh, P.kerf, P.rotate, effort);
@@ -873,9 +856,6 @@ function solve(S, mat, orient, start, effort){
     s.placed.sort((a, b) => a.y - b.y || a.x - b.x);
     s.placed.forEach((pl, k) => {
       pl.piece.sheet = s.no; pl.piece.label = s.kind === 'whole' ? String(s.no) : s.no + '.' + (k + 1); pl.piece.rot = pl.rot;
-      // pl.piece pode ser a cópia espelhada (mirrorPieceLocal); a peça original, usada na Vista da
-      // Parede, precisa do mesmo número de chapa/peça pra mostrar o rótulo certo no desenho da parede.
-      if (pl.piece.__orig) Object.assign(pl.piece.__orig, { sheet: pl.piece.sheet, label: pl.piece.label, rot: pl.piece.rot });
     });
     s.free.forEach(f => { f.reusable = Math.min(f.w, f.h) >= P.minRem; });
   });
@@ -1646,16 +1626,12 @@ function panePlan(){
   ${S.params.cncEngrave ? engraveInstallNote() : ''}
   <div class="sheet-grid">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>${legend()}`;
 }
-// Regra de instalação da face gravada: o desenho abaixo mostra a peça exatamente como ela fica na
-// mesa da CNC (face gravada "pra cima"). Por pedido do Carlos, a face gravada deve SEMPRE ficar voltada
-// para o lado visível (fachada/ambiente), nos dois lados de uma parede de duas faces -- nunca escondida
-// contra o montante; isso é uma regra de MONTAGEM (o app não decide pra qual lado a chapa é virada).
-// Virar a chapa pra cumprir essa regra na Face Interna espelha esquerda/direita (não cima/baixo) --
-// por isso, nas peças com recorte (vão de porta/janela), o corte da Face Interna já SAI da mesa da CNC
-// com o recorte espelhado dentro da própria peça (ver mirrorPieceLocal/solve()), pra cair no lado certo
-// do vão depois de virada. A nota abaixo só precisa deixar a regra de montagem explícita pro operador.
+// Regra de instalação da face gravada: por pedido do Carlos, a face gravada deve ficar voltada para o
+// lado visível (fachada/ambiente) -- isso é uma regra de MONTAGEM, decidida na obra peça a peça (o app
+// não calcula nem força nenhum espelhamento de corte pra isso; o corte das duas faces é sempre idêntico,
+// só rotação é permitida na operação). A nota abaixo só deixa a regra explícita pro operador.
 function engraveInstallNote(){
-  return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante. Em peças com recorte (vão de porta/janela), o corte da Face Interna já vem ajustado para essa regra. Vale para as duas faces de uma parede de duas faces.</div>`;
+  return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante.</div>`;
 }
 function sheetCard(s, r){
   const used = s.placed.reduce((a, p) => a + plArea(p), 0), tot = r.sw * r.sh, { W, H, mdim } = sheetAxes(r);
@@ -1663,7 +1639,8 @@ function sheetCard(s, r){
     ? `<option value="">Chapa inteira (todos os cortes)</option>${s.placed.map(pl => { const [dw, dh] = mdim(pl.w, pl.h); return `<option value="${esc(pl.piece.label)}">Só a peça ${esc(pl.piece.label)} — ${mm(dw)} × ${mm(dh)} mm${pl.piece.shape ? ' (' + shapeTag(pl.piece.shape) + ')' : ''}</option>`; }).join('')}`
     : '';
   return `<div class="sheet-card"><h3>Chapa ${s.no} · ${s.kind === 'whole' && !s.trimmed ? 'inteira' : s.kind === 'whole' ? 'inteira (com ajuste)' : 'cortada'}</h3>
-    <p>${mm(W)} × ${mm(H)} mm · aproveitamento ${fmtP(used / tot * 100)} · ${s.cuts} corte${s.cuts === 1 ? '' : 's'}</p>${renderSheetCuttingPlan(s, r)}
+    <p>${mm(W)} × ${mm(H)} mm · aproveitamento ${fmtP(used / tot * 100)} · ${s.cuts} corte${s.cuts === 1 ? '' : 's'}</p>
+    ${renderSheetCuttingPlan(s, r)}
     ${s.cutLines.length ? `<div class="gcode-btn" style="margin-top:8px">${opts ? `<div class="inp" style="margin-bottom:6px"><select data-gcpiece="${s.no}">${opts}</select></div>` : ''}<button class="btn ghost sm" style="width:100%" data-act3="gcode" data-sheet="${s.no}" data-layer="${CUR_LAYER}">Baixar programa de usinagem</button><button class="btn ghost sm" style="width:100%;margin-top:6px" data-act3="sim" data-sheet="${s.no}" data-layer="${CUR_LAYER}">▶ Simular usinagem</button></div>` : '<p class="hint" style="margin:8px 0 0">Sem cortes — usar a chapa inteira, sem programar a máquina.</p>'}</div>`;
 }
 function paneList(){
