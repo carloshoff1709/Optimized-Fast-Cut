@@ -316,34 +316,46 @@ function calculateWaste(pieceArea, nominal){ return nominal > 0 ? (nominal - pie
    - M > 0: modulação de montantes. Cada junta CAI SOBRE O EIXO de um montante
             (eixos em axisOrigin + k*M). A peça ocupa o maior nº de módulos que cabe na chapa.
    - lead: controla a 1ª peça (usado para desencontrar juntas entre fiadas)
-           M>0 -> nº de módulos da 1ª peça | M=0 -> largura da 1ª peça em mm            */
+           M>0 -> nº de módulos da 1ª peça | M=0 -> largura da 1ª peça em mm
+   - tol: só usada quando M>0 (mesma "Tolerância p/ contar como chapa inteira" do resto do app, P.tol).
+          Pedido do Carlos: no eixo do montante, só a peça RECORTADA (que não alcança o tamanho nominal
+          da chapa) cede a folga -- a peça que sai "chapa inteira" (atinge o nominal, dentro de tol) não
+          tem seu dimensional ajustado, fica exatamente no tamanho da chapa, encostada no eixo. Por isso
+          a folga nunca é dividida meio a meio aqui: quando a peça que termina numa junta é recortada,
+          ela sozinha recua o valor inteiro de g (a peça seguinte começa normal, exatamente no eixo do
+          montante) -- ver uso de wholeHere abaixo.                                                    */
 /* forb: zonas proibidas para o CENTRO de uma junta, lista de intervalos abertos [lo, hi] (mesmo sistema
    de coordenadas do trecho). Usadas para manter as juntas longe dos cantos das aberturas.           */
 function inForb(j, forb){ for (let i = 0; i < forb.length; i++){ if (j > forb[i][0] + EPS && j < forb[i][1] - EPS) return forb[i]; } return null; }
-function buildSpan(len, size, g, M, axisOrigin, lead, forb){
-  forb = forb || [];
+function buildSpan(len, size, g, M, axisOrigin, lead, forb, tol){
+  forb = forb || []; tol = tol || 0;
   const out = []; let s = 0, first = true, guard = 0;
   while (s < len - EPS && guard++ < 500){
     const remaining = len - s;
     let end, next;
     if (first && lead != null){
       let c;
-      if (M > 0){ c = axisOrigin + lead * M; end = c - g / 2; next = c + g / 2; }
+      if (M > 0){
+        c = axisOrigin + lead * M;
+        const wholeHere = (c - s) >= size - tol - EPS;   // chega no tamanho nominal -- não desconta folga aqui
+        end = wholeHere ? c : c - g; next = c;
+      }
       else { end = s + Math.min(lead, size); c = end + g / 2; next = end + g; }
       if (end >= len - EPS){ end = len; next = len; }
       else if (inForb(c, forb)) return null;                // 1ª junta cairia perto de um canto
     } else if (remaining <= size + EPS){ end = len; next = len; }
     else if (M > 0){
       let bestB = null;
-      const kStart = Math.floor((s + g / 2 - axisOrigin) / M) + 1;
+      const kStart = Math.floor((s - axisOrigin) / M) + 1;
       for (let k = kStart; k < kStart + 400; k++){
-        const b = axisOrigin + k * M, e = b - g / 2;
-        if (e - s > size + EPS) break;
-        if (e - s > 1 && b < len && !inForb(b, forb)) bestB = b;   // eixo de montante só serve se não cair perto de um canto
+        const b = axisOrigin + k * M;
+        if (b - s > size + EPS) break;
+        if (b - s > 1 && b < len && !inForb(b, forb)) bestB = b;   // eixo de montante só serve se não cair perto de um canto
         if (b >= len) break;
       }
       if (bestB == null) return null;                       // chapa menor que a modulação
-      end = bestB - g / 2; next = bestB + g / 2;
+      const wholeHere = (bestB - s) >= size - tol - EPS;      // chega no tamanho nominal -- não desconta folga aqui
+      end = wholeHere ? bestB : bestB - g; next = bestB;
     } else {
       end = s + size; let c = end + g / 2, f;
       for (let it = 0; it < 30 && (f = inForb(c, forb)); it++) c = f[0];   // recua a junta até a borda da zona proibida
@@ -358,23 +370,27 @@ function buildSpan(len, size, g, M, axisOrigin, lead, forb){
 }
 
 /* Divide a largura da parede conforme o "sentido de início" (esquerda | direita | centro). */
-function buildAxis(len, size, g, M, start, lead, forb){
-  if (M > 0) g = 0;   // com montante: a junta cai no eixo do montante, a chapa NÃO é refilada (ex.: 2400 mm em módulos de 600)
+function buildAxis(len, size, g, M, start, lead, forb, tol){
   forb = forb || [];
   if (len <= size + EPS) return [{ a: 0, b: len }];
-  if (start === 'left') return buildSpan(len, size, g, M, 0, lead, forb);
+  if (start === 'left') return buildSpan(len, size, g, M, 0, lead, forb, tol);
   if (start === 'right'){
-    const r = buildSpan(len, size, g, M, 0, lead, forb.map(f => [len - f[1], len - f[0]]));
+    const r = buildSpan(len, size, g, M, 0, lead, forb.map(f => [len - f[1], len - f[0]]), tol);
     return r && r.map(p => ({ a: len - p.b, b: len - p.a })).reverse();
   }
-  // centro: junta no meio da parede, duas metades (espelhadas quando não há zonas proibidas)
-  const half = (len - g) / 2;
-  if (inForb(half + g / 2, forb)) return null;              // a junta central cairia perto de um canto
-  const hl = buildSpan(half, size, g, M, -g / 2, lead, forb.map(f => [half - f[1], half - f[0]]));
-  const hr = forb.length ? buildSpan(half, size, g, M, -g / 2, lead, forb.map(f => [f[0] - (half + g), f[1] - (half + g)])) : hl;
+  // centro: junta no meio da parede, duas metades (espelhadas quando não há zonas proibidas). Com
+  // montante, a junta CENTRAL em si continua sem desconto de folga (igual já era antes -- caso não
+  // coberto pelo pedido novo do Carlos, que falou especificamente do eixo do montante repetido pela
+  // fiada); as juntas RECORTADAS calculadas dentro de cada metade (buildSpan, abaixo) já ganham a
+  // folga normalmente, porque a folga real (g, não gC) é passada pra dentro de buildSpan.
+  const gC = M > 0 ? 0 : g;
+  const half = (len - gC) / 2;
+  if (inForb(half + gC / 2, forb)) return null;              // a junta central cairia perto de um canto
+  const hl = buildSpan(half, size, g, M, -gC / 2, lead, forb.map(f => [half - f[1], half - f[0]]), tol);
+  const hr = forb.length ? buildSpan(half, size, g, M, -gC / 2, lead, forb.map(f => [f[0] - (half + gC), f[1] - (half + gC)]), tol) : hl;
   if (!hl || !hr) return null;
   const left = hl.map(p => ({ a: half - p.b, b: half - p.a })).reverse();
-  const right = hr.map(p => ({ a: half + g + p.a, b: half + g + p.b }));
+  const right = hr.map(p => ({ a: half + gC + p.a, b: half + gC + p.b }));
   return left.concat(right);
 }
 function joints(cols){ return cols.slice(1).map((c, i) => (cols[i].b + c.a) / 2); }
@@ -542,6 +558,26 @@ function describeShape(bb, voids){
   const label = { L: 'Em L', U: 'Em U', moldura: 'Moldura (com furo)', recortes: 'Com recortes' }[shape];
   return { shape, desc: label + ' — recorte ' + parts.map(p => p.txt).join('; ') };
 }
+/* Pré-espelhar o recorte de UMA peça da Face Interna, por dentro da própria peça (em volta do centro
+   dela -- a peça continua no MESMO slot/montante da parede; só o que está DENTRO do contorno vira).
+   Por quê: a regra de instalação (pedida pelo Carlos) é a face GRAVADA sempre ficar voltada pro lado
+   visível (fachada/ambiente). Pra isso, a peça física é virada na instalação -- e virar sem derrubar
+   espelha esquerda/direita (nunca cima/baixo). Se o recorte foi cortado "normal" (como se nunca fosse
+   virada), depois de virada pra gravação ficar à vista ele cai do lado ERRADO do vão. Pré-espelhando o
+   recorte aqui, depois de virada ele cai no lado CERTO -- sem exceção, sem o instalador ter que decidir
+   nada peça a peça. Isso só muda O QUE vai ser cortado (dado), nunca COMO a CNC corta (continua um corte
+   normal, de um jeito só, igual sempre -- nada de mesa espelhada nem toolpath espelhado).
+   Usado só no lado do CORTE (G-code, Plano de corte, lista de peças) -- ver placePiece() -- nunca na
+   Vista da parede, que continua mostrando a peça na posição REAL (sem essa virada), porque a Vista e o
+   corte respondem perguntas diferentes: "onde essa peça fica de verdade" vs. "o que mandar pra CNC
+   sabendo que essa peça específica vai ser virada na instalação". */
+function mirrorPieceCutLocal(p){
+  const bx0 = p.x, bx1 = p.x + p.w;
+  const mirrorRects = rs => rs.map(r => ({ x0: bx0 + bx1 - r.x1, x1: bx0 + bx1 - r.x0, y0: r.y0, y1: r.y1 }));
+  const cutBody = mirrorRects(p.body), cutVoids = mirrorRects(p.voids);
+  const d = describeShape({ x0: bx0, x1: bx1, y0: p.y, y1: p.y + p.h }, cutVoids);
+  return { cutBody, cutVoids, cutShapeDesc: d.desc };
+}
 /* Área da união de retângulos {x0,x1,y0,y1} (compressão de coordenadas). */
 function rectsUnionArea(rs){
   rs = rs.filter(r => r.x1 - r.x0 > 1e-9 && r.y1 - r.y0 > 1e-9); if (!rs.length) return 0;
@@ -597,13 +633,13 @@ function calculateLayout(wall, sw, sh, P, start){
     const altModes = P.studs > 0 ? [] : ['left', 'right', 'center'].filter(m => m !== start);
     const attempt = f => {
       if (r === 0 || !(P.stagger > 0)){
-        let c = buildAxis(W, sw, P.gapV, P.studs, start, null, f);
-        if (!c && f.length) for (const m of altModes){ c = buildAxis(W, sw, P.gapV, P.studs, m, null, f); if (c) break; }
+        let c = buildAxis(W, sw, P.gapV, P.studs, start, null, f, P.tol);
+        if (!c && f.length) for (const m of altModes){ c = buildAxis(W, sw, P.gapV, P.studs, m, null, f, P.tol); if (c) break; }
         return c ? { c, d: null } : null;
       }
       const prev = rowCols[r - 1]; let best = null, idx = 0;
       const tryModes = modes => { for (const mode of modes) for (const lead of leadOptions(sw, P.gapV, P.studs, mode)){
-        const c = buildAxis(W, sw, P.gapV, P.studs, mode, lead, f); idx++; if (!c) continue;
+        const c = buildAxis(W, sw, P.gapV, P.studs, mode, lead, f, P.tol); idx++; if (!c) continue;
         const d = minJointDist(prev, c), viol = d < P.stagger - EPS;
         // ordem de preferência: cumpre o mínimo > sem tiras finas > menos peças > (cumprindo) desencontro o mais próximo do pedido,
         // (não cumprindo) o MAIOR desencontro possível > ordem de teste
@@ -711,8 +747,13 @@ function placePiece(b, p, k, split){
   const pl = { x: fr.x, y: fr.y, w: pw, h: ph, rot: b.rot, piece: p };
   if (p.voids && p.voids.length && !b.rot){
     const dx = fr.x - p.x, dy = fr.y - p.y;
-    pl.body = p.body.map(r => ({ x: r.x0 + dx, y: r.y0 + dy, w: r.x1 - r.x0, h: r.y1 - r.y0 }));
-    pl.voids = p.voids.map(r => ({ x: r.x0 + dx, y: r.y0 + dy, w: r.x1 - r.x0, h: r.y1 - r.y0 }));
+    // cutBody/cutVoids (Face Interna com recorte perto de vão) têm prioridade sobre body/voids aqui --
+    // ver mirrorPieceCutLocal() -- porque é exatamente aqui que a peça "de verdade" (wall-space) vira o
+    // que vai pra chapa física (sheet-space): Plano de corte, G-code e gravação (engraveTargetRect) lêem
+    // tudo daqui pra baixo (pl.body/pl.voids), nunca de p.body/p.voids direto.
+    const cb = p.cutBody || p.body, cv = p.cutVoids || p.voids;
+    pl.body = cb.map(r => ({ x: r.x0 + dx, y: r.y0 + dy, w: r.x1 - r.x0, h: r.y1 - r.y0 }));
+    pl.voids = cv.map(r => ({ x: r.x0 + dx, y: r.y0 + dy, w: r.x1 - r.x0, h: r.y1 - r.y0 }));
   }
   s.placed.push(pl);
   const rw = fr.w - pw, rh = fr.h - ph;
@@ -859,6 +900,10 @@ function solve(S, mat, orient, start, effort){
       const wallPi = Object.assign({}, wallP, { faceAvoid, faceOff: wall.stagger || 0 });
       const layI = calculateLayout(wall, sw, sh, wallPi, start);
       if (layI.error) return { error: `${wall.name} (Face Interna): ${layI.error}` };
+      // Pré-espelhar (só pro CORTE, nunca pra Vista da parede) o recorte de cada peça com vão perto --
+      // ver mirrorPieceCutLocal() -- pra "gravação sempre à vista" sair geometricamente garantida, sem
+      // depender do instalador adivinhar/decidir isso peça a peça (pedido explícito do Carlos).
+      layI.pieces.forEach(p => { if (p.voids && p.voids.length) Object.assign(p, mirrorPieceCutLocal(p)); });
       entries.push({ wall: fi, lay: cloneLayForFace(layI, fi), realWallId: wall.id });
     } else {
       entries.push({ wall, lay, realWallId: wall.id });
@@ -873,11 +918,14 @@ function solve(S, mat, orient, start, effort){
     if (trimH){ cutLines.push({ x1: 0, y1: p.h + P.kerf / 2, x2: sw, y2: p.h + P.kerf / 2 }); cuts++; kerfArea += sw * P.kerf; }
     sheets.push({ kind: 'whole', trimmed: trimW || trimH, placed: [{ x: 0, y: 0, w: p.w, h: p.h, rot: false, piece: p }], free: [], cutLines, cuts, kerfArea });
   }));
-  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). Cada peça, em qualquer face,
-  // nunca precisa ser espelhada pra cortar ou instalar -- só rotação é permitida na operação (regra do
-  // Carlos). Quando a parede não tem "desencontro mínimo das juntas" pedido (wall.stagger = 0), as duas
-  // faces continuam usando a MESMA modulação (mesmo recorte, mesma posição), como sempre foi. Quando tem
-  // (amarração entre faces, ver solve()), a Face Interna pode ter peças de largura diferente da Face
+  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). A OPERAÇÃO da CNC nunca
+  // espelha nada -- corta sempre de um jeito só, normal (regra do Carlos). O que PODE diferir, só na Face
+  // Interna, é o PLANEJAMENTO do corte: peças com recorte perto de vão saem com o recorte pré-espelhado
+  // (ver mirrorPieceCutLocal(), aplicado logo acima), pra "gravação sempre à vista" sair garantida depois
+  // da peça virada na instalação -- isso é uma decisão de dado (qual forma cortar), não uma operação da
+  // máquina. Quando a parede não tem "desencontro mínimo das juntas" pedido (wall.stagger = 0), as duas
+  // faces continuam usando a MESMA modulação (mesmas posições de peça), como sempre foi. Quando tem
+  // (amarração entre faces, ver acima), a Face Interna pode ter peças de largura diferente da Face
   // Externa na mesma fiada -- de propósito, pra desencontrar as juntas verticais entre as faces.
   const cutPieces = e => e.lay.pieces.filter(p => !p.whole);
   const pools = P.share ? [entries.flatMap(cutPieces)] : entries.map(cutPieces);
@@ -957,8 +1005,10 @@ function calculateCuts(res){
   const map = new Map();
   res.sheets.forEach(sh => sh.placed.forEach(pl => {
     if (sh.kind === 'whole' && !sh.trimmed) return;
-    const p = pl.piece, key = mm(p.w) + 'x' + mm(p.h) + '|' + (p.shapeDesc || '');
-    if (!map.has(key)) map.set(key, { w: p.w, h: p.h, shape: p.shapeDesc || '', qty: 0, sheets: new Set(), walls: new Set() });
+    // cutShapeDesc (Face Interna com recorte pré-espelhado) tem prioridade -- a lista de peças a cortar
+    // descreve o CORTE de verdade (o que vai pra CNC), não a posição na parede.
+    const p = pl.piece, desc = p.cutShapeDesc || p.shapeDesc, key = mm(p.w) + 'x' + mm(p.h) + '|' + (desc || '');
+    if (!map.has(key)) map.set(key, { w: p.w, h: p.h, shape: desc || '', qty: 0, sheets: new Set(), walls: new Set() });
     const g = map.get(key); g.qty++; g.sheets.add(sh.no); g.walls.add(p.wallName);
   }));
   return Array.from(map.values()).sort((a, b) => b.w * b.h - a.w * a.h);
@@ -1197,7 +1247,7 @@ function renderInputs(){
       ${lenField('Distância mín. da junta ao canto da abertura', P.cornerClear, 'data-p="cornerClear"', 'mm')}
       <p class="hint" style="margin:22px 0 0">Regra técnica: nenhuma junta a menos de 200 mm do canto de porta/janela; a chapa que contorna o canto é cortada inteira em L (ou U). Com 0 a distância deixa de ser exigida, mas as peças continuam inteiras em L/U.</p>
     </div>
-    ${P.studs > 0 ? '<p class="hint">Com montantes, a chapa começa encostada na parede (pegando o montante inteiro) e a junta cai no eixo do montante. Chapas múltiplas da modulação (ex.: 2400 mm em módulos de 600) não são refiladas e a junta vertical não é descontada.</p>' : ''}
+    ${P.studs > 0 ? `<p class="hint">Com montantes, a chapa começa encostada na parede (pegando o montante inteiro) e a junta cai no eixo do montante. Quando a peça daquele lado do eixo sai <b>chapa inteira</b> (atinge o tamanho nominal, dentro da tolerância configurada) ela não é refilada (ex.: 2400 mm, não 2397 mm) e não perde nada na junta. Quando a peça precisa ser <b>recortada</b> para caber na modulação, ela sozinha cede a folga vertical (${mm(P.gapV)} mm) naquela junta.</p>` : ''}
     ${studsMode === 'custom' ? `<label class="check"><input type="checkbox" data-p="showStuds" ${P.showStuds ? 'checked' : ''}> Mostrar montantes no desenho</label>` : ''}
     <hr class="sep">
     <details class="adv"><summary>Ajustes avançados</summary>
@@ -1697,9 +1747,10 @@ function panePlan(){
   <div class="sheet-grid">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>${legend()}`;
 }
 // Regra de instalação da face gravada: por pedido do Carlos, a face gravada deve ficar voltada para o
-// lado visível (fachada/ambiente) -- isso é uma regra de MONTAGEM, decidida na obra peça a peça (o app
-// não calcula nem força nenhum espelhamento de corte pra isso; o corte das duas faces é sempre idêntico,
-// só rotação é permitida na operação). A nota abaixo só deixa a regra explícita pro operador.
+// lado visível (fachada/ambiente). Peças da Face Interna com recorte perto de vão já saem cortadas com
+// o recorte pré-espelhado pra essa regra fechar geometricamente (ver mirrorPieceCutLocal()/solve()) --
+// a nota abaixo só deixa a regra explícita pro operador, pra todas as peças (inclusive as sem recorte,
+// que não dependem de nada no corte pra isso, só da instalação mesmo).
 function engraveInstallNote(){
   return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante.</div>`;
 }
@@ -2113,7 +2164,7 @@ function generateReport(){
     <table><tbody>
       <tr><td>Chapa</td><td>${esc(R.mat.name)} (${esc(R.mat.type)}) · ${mm(R.mat.w)} × ${mm(R.mat.h)} mm · espessura ${fmtNum(R.mat.t, 1)} mm</td></tr>
       <tr><td>Sentido / início</td><td>${ORIENT_NAME[r.orient]} · início pela ${START_NAME[r.start].toLowerCase()}</td></tr>
-      <tr><td>Juntas</td><td>${P.studs > 0 ? 'vertical no eixo do montante (não descontada)' : 'vertical ' + mm(P.gapV) + ' mm'} · horizontal ${mm(P.gapH)} mm · serra ${mm(P.kerf)} mm · folga do piso ${mm(P.floorGap || 0)} mm</td></tr>
+      <tr><td>Juntas</td><td>${P.studs > 0 ? 'vertical no eixo do montante (' + mm(P.gapV) + ' mm só nas peças recortadas — chapa inteira não desconta)' : 'vertical ' + mm(P.gapV) + ' mm'} · horizontal ${mm(P.gapH)} mm · serra ${mm(P.kerf)} mm · folga do piso ${mm(P.floorGap || 0)} mm</td></tr>
       <tr><td>Montantes</td><td>${P.studs > 0 ? 'a cada ' + mm(P.studs) + ' mm' : 'sem modulação'} · desencontro mínimo de juntas: por parede, veja a tabela acima</td></tr></tbody></table>
     <h2>Resultado</h2>
     <table><tbody>
@@ -3099,7 +3150,7 @@ function buildPDF(){
   h2('Material e montagem');
   kv([['Chapa', R.mat.name + ' (' + R.mat.type + ')  ' + mm(R.mat.w) + ' x ' + mm(R.mat.h) + ' mm  esp. ' + fmtNum(R.mat.t, 1) + ' mm'].map((c, i) => i ? c : c),
     ['Sentido', (r.orient === 'standing' ? 'Em pé' : 'Deitada') + '  |  início pela ' + START_NAME[r.start].toLowerCase() + (P.studs > 0 ? '  |  montantes a cada ' + mm(P.studs) + ' mm' : '  |  sem montantes')],
-    ['Juntas', (P.studs > 0 ? 'vertical no eixo do montante' : 'vertical ' + mm(P.gapV) + ' mm') + '  |  horizontal ' + mm(P.gapH) + ' mm  |  serra ' + mm(P.kerf) + ' mm  |  folga do piso ' + mm(P.floorGap || 0) + ' mm (desencontro mín. de juntas: por parede, veja a tabela "Paredes")']], [0, 22]);
+    ['Juntas', (P.studs > 0 ? 'vertical no eixo do montante (' + mm(P.gapV) + ' mm só nas recortadas)' : 'vertical ' + mm(P.gapV) + ' mm') + '  |  horizontal ' + mm(P.gapH) + ' mm  |  serra ' + mm(P.kerf) + ' mm  |  folga do piso ' + mm(P.floorGap || 0) + ' mm (desencontro mín. de juntas: por parede, veja a tabela "Paredes")']], [0, 22]);
   h2('Balanço de áreas');
   kv([['Área da parede (bruta)', fmtA(m.gross), 'Área comprada', fmtA(m.nominal)], ['Aberturas', fmtA(m.openArea), 'Área utilizada (peças)', fmtA(m.pieceArea)], ['Área a revestir', fmtA(m.net), 'Sobra total', fmtA(m.waste)],
     ['Folga do piso + juntas', fmtA(m.floorArea + m.jointArea), 'Sobra reaproveitável', fmtA(m.reusableArea)], ['Recuo ao redor das aberturas', fmtA(m.marginArea), 'Resíduo', fmtA(m.residueArea)],
