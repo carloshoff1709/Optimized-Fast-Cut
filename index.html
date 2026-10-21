@@ -580,13 +580,19 @@ function calculateLayout(wall, sw, sh, P, start){
   const D = P.cornerClear > 0 ? P.cornerClear : 0;
   const corners = cornerPoints(wall, W, H, fg, D);
   const avoid = P.avoid ? avoidFor(P, wall.id) : null, off = avoid && P.layerOff > 0 ? P.layerOff : 0;
+  // Amarração entre Face Externa e Face Interna (tipo "tijolinho"): reaproveita o MESMO mecanismo do
+  // revestimento-sobre-OSB acima (evitar junta de uma referência), só que a referência aqui é a própria
+  // Face Externa desta parede (ver solve()), e o valor mínimo é o campo "desencontro mínimo das juntas"
+  // já cadastrado por parede (wall.stagger) -- reaproveitado como pedido pelo Carlos, sem campo novo.
+  // Só vale para juntas VERTICAIS (a pedido dele); nunca entra no cálculo das fiadas (linha abaixo).
+  const faceOff = P.faceAvoid && P.faceOff > 0 ? P.faceOff : 0;
   const cornerY = corners.map(c => [c.y - D, c.y + D]), layerY = off && P.layerH ? avoid.h.map(y => [y - off, y + off]) : [];
   let rows = buildRows(H, fg, sh, P.gapH, cornerY.concat(layerY));
   if (rows.forced && layerY.length) rows = buildRows(H, fg, sh, P.gapH, cornerY);   // a regra dos cantos vale mais que o desencontro entre camadas
   if (!rows || !rows.length) return { error: 'não foi possível montar as fiadas' };
   const rowCols = [], warnings = []; let minStag = Infinity, staggerShort = 0;
   for (let r = 0; r < rows.length; r++){
-    const fxC = forbX(corners, rows[r], D), fxL = off ? layerX(avoid, rows[r], off) : [];
+    const fxC = forbX(corners, rows[r], D), fxL = off ? layerX(avoid, rows[r], off) : [], fxF = faceOff ? layerX(P.faceAvoid, rows[r], faceOff) : [];
     // Com montantes, a grade de montantes é fixa (definida pelo sentido de início): não dá para "iniciar por outro lado" só numa fiada.
     const altModes = P.studs > 0 ? [] : ['left', 'right', 'center'].filter(m => m !== start);
     const attempt = f => {
@@ -608,8 +614,8 @@ function calculateLayout(wall, sw, sh, P, start){
       if (!best || best.key[0] === 1) tryModes(altModes);
       return best ? { c: best.c, d: best.d } : null;
     };
-    let res = attempt(fxC.concat(fxL));
-    if (!res && fxL.length) res = attempt(fxC);             // não dá para desencontrar das juntas do OSB: mantém a regra dos cantos e avisa
+    let res = attempt(fxC.concat(fxL).concat(fxF));
+    if (!res && (fxL.length || fxF.length)) res = attempt(fxC);   // não dá para desencontrar do OSB/da outra face: mantém a regra dos cantos e avisa
     if (!res && fxC.length) res = attempt([]);              // sem solução respeitando os cantos: usa a grade normal e avisa
     if (!res) return (r === 0 || !(P.stagger > 0)) ? { error: `a chapa (${mm(sw)} mm de largura) é menor que a modulação dos montantes (${mm(P.studs)} mm)` } : { error: 'não foi possível montar a fiada ' + (r + 1) };
     if (res.d != null){
@@ -633,6 +639,16 @@ function calculateLayout(wall, sw, sh, P, start){
       if (d < off - 0.5){ layerShort += off - d; warnings.push(`Junta horizontal do revestimento a ${mm(d)} mm de uma junta horizontal do OSB (mínimo pedido: ${mm(off)} mm).`); }
     }); });
   }
+  // desencontro (amarração) entre as juntas verticais desta face e as da outra face da mesma parede
+  let minFaceStag = Infinity, faceStagShort = 0;
+  if (faceOff){
+    const seen2 = new Set();
+    rows.forEach((rw, ri) => joints(rowCols[ri]).forEach(x => P.faceAvoid.v.forEach(o => {
+      if (!(o.y1 > rw.a + EPS && o.y0 < rw.b - EPS)) return;
+      const d = Math.abs(x - o.x); minFaceStag = Math.min(minFaceStag, d);
+      if (d < faceOff - 0.5){ faceStagShort += faceOff - d; const k = Math.round(x) + '|' + Math.round(o.x); if (!seen2.has(k)){ seen2.add(k); warnings.push(`Junta vertical a ${mm(d)} mm da junta da outra face (amarração mínima pedida: ${mm(faceOff)} mm).`); } }
+    })));
+  }
   // células -> peças: cada parte conexa (célula menos aberturas) é UMA peça, com recorte em L/U/moldura quando o vão a atravessa
   const ops = wall.openings.map(o => openingCutRect(o, W, H));
   const pieces = []; let id = 0;
@@ -648,7 +664,7 @@ function calculateLayout(wall, sw, sh, P, start){
       pieces.push(piece);
     });
   }));
-  return { rows, rowCols, pieces, warnings, minStag, sw, sh, corners, cornerViol: cw.length, staggerShort, minLayer, layerShort };
+  return { rows, rowCols, pieces, warnings, minStag, sw, sh, corners, cornerViol: cw.length, staggerShort, minLayer, layerShort, minFaceStag, faceStagShort };
 }
 function subRect(r, o){
   const ix0 = Math.max(r.x0, o.x0), ix1 = Math.min(r.x1, o.x1), iy0 = Math.max(r.y0, o.y0), iy1 = Math.min(r.y1, o.y1);
@@ -823,12 +839,27 @@ function solve(S, mat, orient, start, effort){
     // desencontro mínimo das juntas é por parede -- sobrescreve só esse campo num clone raso de P,
     // mantendo todo o resto (modulação, juntas, orientação etc.) igual pra todas as paredes
     const wallP = Object.assign({}, P, { stagger: wall.stagger || 0 });
-    const lay = calculateLayout(wall, sw, sh, wallP, start);
+    const lay = calculateLayout(wall, sw, sh, wallP, start);     // Face Externa (ou parede normal, sem 2 faces)
     if (lay.error) return { error: `${wall.name}: ${lay.error}` };
     if (wall.twoFaces){
       const fe = faceWall(wall, 'ext'), fi = faceWall(wall, 'int');
       entries.push({ wall: fe, lay: cloneLayForFace(lay, fe), realWallId: wall.id });
-      entries.push({ wall: fi, lay: cloneLayForFace(lay, fi), realWallId: wall.id });
+      // Face Interna: "amarração" entre as faces (tipo tijolinho) -- as juntas VERTICAIS da Face Interna
+      // não podem cair a menos do que o "desencontro mínimo das juntas" já cadastrado nesta parede (wall.
+      // stagger) das juntas verticais da Face Externa (reaproveita o valor desse campo, a pedido do
+      // Carlos, sem criar campo novo; não afeta juntas horizontais). Isso exige uma paginação própria pra
+      // Face Interna (não é mais um clone 1:1 da Face Externa) -- reaproveita o mesmo mecanismo já usado
+      // pra desencontrar o revestimento das juntas do OSB (layerX/avoidFor), só que a "camada de baixo" a
+      // evitar agora é a própria Face Externa desta parede. Fiadas (linhas horizontais) continuam
+      // IDÊNTICAS entre as faces (mesma altura H, mesma folga, sem avoidance vertical aqui) -- só a
+      // divisão em colunas de cada fiada pode diferir entre as faces. Quando wall.stagger é 0 (padrão),
+      // faceOff sai 0 e o resultado é idêntico ao de antes (clone 1:1), sem mudar nenhum projeto existente.
+      const faceAvoid = { v: [] };
+      lay.rowCols.forEach((cols, ri) => joints(cols).forEach(x => faceAvoid.v.push({ x, y0: lay.rows[ri].a, y1: lay.rows[ri].b })));
+      const wallPi = Object.assign({}, wallP, { faceAvoid, faceOff: wall.stagger || 0 });
+      const layI = calculateLayout(wall, sw, sh, wallPi, start);
+      if (layI.error) return { error: `${wall.name} (Face Interna): ${layI.error}` };
+      entries.push({ wall: fi, lay: cloneLayForFace(layI, fi), realWallId: wall.id });
     } else {
       entries.push({ wall, lay, realWallId: wall.id });
     }
@@ -842,8 +873,12 @@ function solve(S, mat, orient, start, effort){
     if (trimH){ cutLines.push({ x1: 0, y1: p.h + P.kerf / 2, x2: sw, y2: p.h + P.kerf / 2 }); cuts++; kerfArea += sw * P.kerf; }
     sheets.push({ kind: 'whole', trimmed: trimW || trimH, placed: [{ x: 0, y: 0, w: p.w, h: p.h, rot: false, piece: p }], free: [], cutLines, cuts, kerfArea });
   }));
-  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). As duas faces usam a MESMA
-  // peça (mesmo recorte, mesma posição) -- corte idêntico nas duas, só rotação é permitida na operação.
+  // demais peças: nesting (compartilhando sobras entre paredes, se marcado). Cada peça, em qualquer face,
+  // nunca precisa ser espelhada pra cortar ou instalar -- só rotação é permitida na operação (regra do
+  // Carlos). Quando a parede não tem "desencontro mínimo das juntas" pedido (wall.stagger = 0), as duas
+  // faces continuam usando a MESMA modulação (mesmo recorte, mesma posição), como sempre foi. Quando tem
+  // (amarração entre faces, ver solve()), a Face Interna pode ter peças de largura diferente da Face
+  // Externa na mesma fiada -- de propósito, pra desencontrar as juntas verticais entre as faces.
   const cutPieces = e => e.lay.pieces.filter(p => !p.whole);
   const pools = P.share ? [entries.flatMap(cutPieces)] : entries.map(cutPieces);
   for (const pool of pools){
@@ -875,10 +910,16 @@ function calculateRemnants(entries, sheets, sw, sh, P){
   m.nWholeClean = sheets.filter(s => s.kind === 'whole' && !s.trimmed).length;
   m.nWholeTrim = sheets.filter(s => s.kind === 'whole' && s.trimmed).length;
   m.nCutSheets = sheets.filter(s => s.kind === 'cut').length;
-  m.cornerViol = physEntries.reduce((n, e) => n + (e.lay.cornerViol || 0), 0);   // juntas que não respeitam a distância dos cantos
-  m.layerShort = Math.round(physEntries.reduce((n, e) => n + (e.lay.layerShort || 0), 0)); // quanto falta (mm) para o desencontro entre camadas
-  m.minLayer = Math.min(...physEntries.map(e => e.lay.minLayer === undefined ? Infinity : e.lay.minLayer));
-  m.staggerShort = Math.round(physEntries.reduce((n, e) => n + (e.lay.staggerShort || 0), 0)); // quanto falta (mm, somando as fiadas) para o desencontro mínimo
+  // cornerViol/layerShort/minLayer/staggerShort/faceStagShort/minFaceStag vêm de "entries" (não de
+  // "physEntries"/dedup por parede física) porque agora, com a amarração entre faces, a Face Interna pode
+  // ter uma paginação própria (ver solve()) e seus próprios problemas/avisos, distintos da Face Externa --
+  // dedupar por parede escondia isso quando as duas faces eram sempre idênticas; agora cada face conta.
+  m.cornerViol = entries.reduce((n, e) => n + (e.lay.cornerViol || 0), 0);   // juntas que não respeitam a distância dos cantos
+  m.layerShort = Math.round(entries.reduce((n, e) => n + (e.lay.layerShort || 0), 0)); // quanto falta (mm) para o desencontro entre camadas
+  m.minLayer = Math.min(...entries.map(e => e.lay.minLayer === undefined ? Infinity : e.lay.minLayer));
+  m.staggerShort = Math.round(entries.reduce((n, e) => n + (e.lay.staggerShort || 0), 0)); // quanto falta (mm, somando as fiadas) para o desencontro mínimo
+  m.faceStagShort = Math.round(entries.reduce((n, e) => n + (e.lay.faceStagShort || 0), 0)); // quanto falta (mm) para a amarração mínima entre as faces
+  m.minFaceStag = Math.min(...entries.map(e => e.lay.minFaceStag === undefined ? Infinity : e.lay.minFaceStag));
   m.sheetArea = sw * sh;
   m.nominal = m.nSheets * m.sheetArea;
   m.gross = physEntries.reduce((s, e) => s + calculateWallArea(e.wall), 0);
@@ -909,7 +950,7 @@ function calculateRemnants(entries, sheets, sw, sh, P){
   m.nPieces = sheets.filter(s => s.kind === 'cut').reduce((n, s) => n + s.placed.length, 0) + m.nWholeTrim;
   return m;
 }
-function rankResult(r){ return [r.metrics.cornerViol, r.metrics.layerShort, r.metrics.staggerShort, r.metrics.nSheets, r.metrics.cuts, -Math.round(r.metrics.reusableArea), r.metrics.nPieces]; }
+function rankResult(r){ return [r.metrics.cornerViol, r.metrics.layerShort, r.metrics.staggerShort, r.metrics.faceStagShort, r.metrics.nSheets, r.metrics.cuts, -Math.round(r.metrics.reusableArea), r.metrics.nPieces]; }
 
 /* Lista de peças a cortar, agrupada por medida (para enviar ao corte). */
 function calculateCuts(res){
@@ -1421,7 +1462,16 @@ function resultsBlock(layer){
         return `<br>Desencontro entre fiadas obtido: <b>${mm(got)} mm</b> (mínimo pedido: ${mm(target)} mm${got < target - 0.5 ? ' — não foi possível atingir em alguma parede' : got > target + 0.5 ? ' — a melhor opção que cumpre o mínimo' : ''}).`; })()
     : '<br>Desencontro mínimo das juntas: valor configurado por parede (varia entre as paredes deste projeto) — veja os avisos abaixo.';
   const layerLine = P.isClad && isFinite(m.minLayer) && P.layerOff > 0 ? `<br>Menor distância entre juntas do revestimento e do OSB: <b>${mm(m.minLayer)} mm</b> (mínimo pedido: ${mm(P.layerOff)} mm${m.minLayer < P.layerOff - 0.5 ? ' — não foi possível atingir nesta parede' : ''}).` : '';
-  const why = better ? (better.r.metrics.cornerViol < m.cornerViol ? 'Outra combinação testada cumpre a regra dos cantos das aberturas' : better.r.metrics.layerShort < m.layerShort ? 'Outra combinação testada cumpre o desencontro em relação ao OSB' : better.r.metrics.staggerShort < m.staggerShort ? 'Outra combinação testada cumpre o desencontro mínimo pedido' : 'Outra combinação testada usa menos') : '';
+  // amarração entre Face Externa e Face Interna (juntas verticais desencontradas, tipo tijolinho) -- usa o
+  // mesmo valor "desencontro mínimo das juntas" cadastrado por parede (wall.stagger), reaproveitado a
+  // pedido do Carlos; só existe em paredes "duas faces" com esse campo > 0.
+  const faceStagEntries = r.entries.filter(e => (e.wall.stagger || 0) > 0 && isFinite(e.lay.minFaceStag));
+  const faceStagVals = Array.from(new Set(faceStagEntries.map(e => e.wall.stagger)));
+  const faceStagLine = !faceStagEntries.length ? '' : faceStagVals.length === 1
+    ? (() => { const target = faceStagVals[0], got = Math.min(...faceStagEntries.map(e => e.lay.minFaceStag));
+        return `<br>Amarração entre as faces (desencontro de juntas verticais) obtida: <b>${mm(got)} mm</b> (mínimo pedido: ${mm(target)} mm${got < target - 0.5 ? ' — não foi possível atingir em alguma parede' : ''}).`; })()
+    : '<br>Amarração mínima entre as faces: valor configurado por parede (varia entre as paredes deste projeto) — veja os avisos abaixo.';
+  const why = better ? (better.r.metrics.cornerViol < m.cornerViol ? 'Outra combinação testada cumpre a regra dos cantos das aberturas' : better.r.metrics.layerShort < m.layerShort ? 'Outra combinação testada cumpre o desencontro em relação ao OSB' : better.r.metrics.staggerShort < m.staggerShort ? 'Outra combinação testada cumpre o desencontro mínimo pedido' : better.r.metrics.faceStagShort < m.faceStagShort ? 'Outra combinação testada cumpre melhor a amarração entre as faces' : 'Outra combinação testada usa menos') : '';
   return `
   <div class="kpis">
     ${kpi('Chapas necessárias', m.nSheets, m.nSheets === 1 ? 'chapa' : 'chapas', `${m.nWholeClean} inteira${m.nWholeClean === 1 ? '' : 's'} sem corte · ${m.nSheets - m.nWholeClean} a cortar`, 'main')}
@@ -1433,7 +1483,7 @@ function resultsBlock(layer){
   </div>
   <div class="note info">Configuração usada: <b>${ORIENT_NAME[r.orient]}</b>, início pela <b>${START_NAME[r.start].toLowerCase()}</b>, chapa ${esc(R.mat.name)} (${matDimsLabel(R.mat)})${P.studs > 0 ? `, montantes a cada ${mm(P.studs)} mm` : ''}.
     ${P.orientation === 'auto' ? ' O modo automático testou as duas orientações e manteve a que usa menos chapas.' : ''}
-    ${stagLine}${layerLine}
+    ${stagLine}${layerLine}${faceStagLine}
     ${better ? `<br>${why}: <b>${better.r.metrics.nSheets} chapas</b> (${ORIENT_NAME[better.o].split(' (')[0].toLowerCase()}, início pela ${START_NAME[better.st].toLowerCase()}). <button class="btn ghost sm" data-apply="${better.o}|${better.st}" data-layer="${layer}">Aplicar</button>` : ''}</div>
   ${warn.length ? `<div class="note warn"><ul>${warn.map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
   <div>
