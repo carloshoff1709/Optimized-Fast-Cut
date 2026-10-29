@@ -429,8 +429,9 @@ function studLeftover(W, M, start){
 }
 /* Texto curto (pra tabelas) com a sobra da modulação de UMA parede, no mesmo cálculo objetivo de studLeftover. */
 function leftoverLabel(wall, r){
-  if (!(S.params.studs > 0)) return '—';
-  const lv = studLeftover(wall.w, S.params.studs, r.start);
+  const M = effMontP(wall, S.params), st = (wall.montOverride && wall.mont && wall.mont.start) ? wall.mont.start : r.start;
+  if (!(M.studs > 0)) return '—';
+  const lv = studLeftover(wall.w, M.studs, st);
   // Face Interna é desenhada espelhada (ver renderWall) -- o lado dito aqui tem que bater com o que
   // aparece no desenho e não com a coordenada "crua", senão a tabela contradiz a vista da parede.
   const flip = wall.face === 'int';
@@ -877,11 +878,31 @@ function solve(S, mat, orient, start, effort){
   const sh = orient === 'standing' ? Lg : Sd;      // altura da chapa na parede
   const entries = [];
   for (const wall of S.walls){
-    // desencontro mínimo das juntas é por parede -- sobrescreve só esse campo num clone raso de P,
-    // mantendo todo o resto (modulação, juntas, orientação etc.) igual pra todas as paredes
-    const wallP = Object.assign({}, P, { stagger: wall.stagger || 0 });
-    const lay = calculateLayout(wall, sw, sh, wallP, start);     // Face Externa (ou parede normal, sem 2 faces)
-    if (lay.error) return { error: `${wall.name}: ${lay.error}` };
+    // "Montagem" por parede (início, montantes, juntas, folga do piso, distância junta-canto,
+    // tolerância p/ chapa inteira): a parede pode ter valores próprios (wall.mont), caso contrário usa
+    // o padrão do projeto (P) -- mesmo princípio de wall.stagger. Sentido da chapa (orient/sw/sh) NÃO
+    // entra aqui: todas as paredes usam a MESMA chapa (sw/sh) sendo testada nesta chamada de solve(),
+    // porque o nesting/nº de chapas compradas é compartilhado entre paredes -- variar por parede
+    // exigiria rodar um encaixe separado por orientação, fora do escopo deste pedido.
+    // "Montagem por parede" e "continuidade de revestimento" valem só pra camada PRINCIPAL (OSB/chapa de
+    // base) -- a 2ª camada opcional ("4 Revestimento", ex.: gesso sobre o OSB, P.isClad=true) tem o
+    // próprio card de configuração, de propósito nunca usa grade de montantes (cladParams() força
+    // studs=0) e sempre cobre exatamente a parede real, sem a extensão da camada de base. Por isso as
+    // duas sobrescritas por parede ficam DESLIGADAS quando P.isClad, pra não vazar wall.mont/
+    // wall.cladExtend (pensados pro OSB) pra dentro do cálculo do revestimento.
+    const montP = P.isClad ? P : effMontP(wall, P);
+    const wStart = (!P.isClad && wall.montOverride && wall.mont && wall.mont.start) ? wall.mont.start : start;
+    // desencontro mínimo das juntas é por parede -- sobrescreve só esse campo num clone raso de montP
+    const wallP = Object.assign({}, montP, { stagger: wall.stagger || 0 });
+    // Continuidade de revestimento (Face Externa, ou parede normal sem 2 faces): roda a MESMA
+    // calculateLayout() numa "parede virtual" mais larga (ver extendedWall()) e devolve as coordenadas X
+    // pro referencial real da parede (ver shiftLayoutX()) -- ext.left/right = 0 é o caminho de sempre
+    // (extendedWall devolve a própria wall, sem clonar nada).
+    const ce = P.isClad ? defaultCladExtend() : (wall.cladExtend || defaultCladExtend());
+    const extE = ce.ext || { left: 0, right: 0 };
+    const layRawE = calculateLayout(extendedWall(wall, extE.left || 0, extE.right || 0), sw, sh, wallP, wStart);
+    if (layRawE.error) return { error: `${wall.name}: ${layRawE.error}` };
+    const lay = shiftLayoutX(layRawE, -(extE.left || 0));     // Face Externa (ou parede normal, sem 2 faces), já no referencial real
     if (wall.twoFaces){
       const fe = faceWall(wall, 'ext'), fi = faceWall(wall, 'int');
       entries.push({ wall: fe, lay: cloneLayForFace(lay, fe), realWallId: wall.id });
@@ -895,11 +916,17 @@ function solve(S, mat, orient, start, effort){
       // IDÊNTICAS entre as faces (mesma altura H, mesma folga, sem avoidance vertical aqui) -- só a
       // divisão em colunas de cada fiada pode diferir entre as faces. Quando wall.stagger é 0 (padrão),
       // faceOff sai 0 e o resultado é idêntico ao de antes (clone 1:1), sem mudar nenhum projeto existente.
+      const extI = ce.int || { left: 0, right: 0 };
+      // faceAvoid vem de "lay" (Face Externa já no referencial REAL) -- se a Face Interna também tiver
+      // continuidade própria (extI), a Face Interna roda numa parede virtual DIFERENTE da Externa, então
+      // as posições de referência (faceAvoid) precisam ser deslocadas pro referencial VIRTUAL da Interna
+      // antes de entrar em calculateLayout (senão a "amarração" compararia referenciais diferentes).
       const faceAvoid = { v: [] };
-      lay.rowCols.forEach((cols, ri) => joints(cols).forEach(x => faceAvoid.v.push({ x, y0: lay.rows[ri].a, y1: lay.rows[ri].b })));
+      lay.rowCols.forEach((cols, ri) => joints(cols).forEach(x => faceAvoid.v.push({ x: x + (extI.left || 0), y0: lay.rows[ri].a, y1: lay.rows[ri].b })));
       const wallPi = Object.assign({}, wallP, { faceAvoid, faceOff: wall.stagger || 0 });
-      const layI = calculateLayout(wall, sw, sh, wallPi, start);
-      if (layI.error) return { error: `${wall.name} (Face Interna): ${layI.error}` };
+      const layRawI = calculateLayout(extendedWall(wall, extI.left || 0, extI.right || 0), sw, sh, wallPi, wStart);
+      if (layRawI.error) return { error: `${wall.name} (Face Interna): ${layRawI.error}` };
+      const layI = shiftLayoutX(layRawI, -(extI.left || 0));
       // Pré-espelhar (só pro CORTE, nunca pra Vista da parede) o recorte de cada peça com vão perto --
       // ver mirrorPieceCutLocal() -- pra "gravação sempre à vista" sair geometricamente garantida, sem
       // depender do instalador adivinhar/decidir isso peça a peça (pedido explícito do Carlos).
@@ -1048,8 +1075,21 @@ function validate(S, mat){
       else if (!isFinite(o.x) || !isFinite(o.y) || o.x < 0 || o.y < 0) e.push(`${on}: posição X e Y devem ser números válidos (≥ 0).`);
       else if (o.x + o.w > w.w + EPS || o.y + o.h > w.h + EPS) e.push(`${on}: a abertura ultrapassa os limites da parede (${mm(w.w)} × ${mm(w.h)} mm).`);
     });
-    if (P.floorGap >= w.h) e.push(`${n}: a folga do piso (${mm(P.floorGap)} mm) é maior ou igual à altura da parede.`);
+    // Montagem própria desta parede (se houver) só vale pra camada principal (OSB) -- ver comentário em
+    // solve(); a validação da 2ª camada (revestimento/gesso, P.isClad) usa sempre o padrão dela mesma.
+    const wm = P.isClad ? P : effMontP(w, P);
+    if (wm.floorGap >= w.h) e.push(`${n}: a folga do piso (${mm(wm.floorGap)} mm) é maior ou igual à altura da parede.`);
     if (!isFinite(w.stagger) || w.stagger < 0) e.push(`${n}: desencontro mínimo das juntas inválido.`);
+    if (!P.isClad && w.montOverride && w.mont){
+      ['gapV', 'gapH', 'tol', 'floorGap', 'cornerClear'].forEach(k => { if (!isFinite(wm[k]) || wm[k] < 0) e.push(`${n}: valor inválido na montagem própria desta parede: ` + ({ gapV: 'junta vertical', gapH: 'junta horizontal', tol: 'tolerância', floorGap: 'folga do piso', cornerClear: 'distância da junta ao canto da abertura' })[k] + ' (use número ≥ 0).'); });
+      if (!isFinite(wm.studs) || wm.studs < 0) e.push(`${n}: modulação dos montantes inválida (configuração própria desta parede).`);
+    }
+    if (!P.isClad && w.cladExtend){
+      [['ext', 'Face Externa'], ['int', 'Face Interna']].forEach(([k, lbl]) => {
+        const ex = w.cladExtend[k] || {};
+        ['left', 'right'].forEach(side => { const v = ex[side] || 0; if (!isFinite(v) || v < 0) e.push(`${n}: continuidade de revestimento inválida (${lbl}, lado ${side === 'left' ? 'esquerdo' : 'direito'}) -- use número ≥ 0.`); });
+      });
+    }
     for (let i = 0; i < w.openings.length; i++) for (let j = i + 1; j < w.openings.length; j++){
       const a = w.openings[i], b = w.openings[j];
       if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) e.push(`${n}: as aberturas "${a.name}" e "${b.name}" se sobrepõem.`);
@@ -1119,7 +1159,68 @@ const MAT_TYPES = ['OSB', 'Placa cimentícia', 'Compensado', 'MDF', 'MDP', 'Dryw
 // stagger/staggerCustom: desencontro mínimo das juntas -- é POR PAREDE (cada parede pode ter o seu
 // próprio valor, diferente das outras), ao contrário dos demais parâmetros de montagem (modulação,
 // juntas, orientação etc.), que continuam valendo pra todas as paredes do projeto.
-function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false, twoFaces: false }; }
+function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stagger: 0, staggerCustom: false, twoFaces: false, montOverride: false, cladExtend: defaultCladExtend() }; }
+/* Continuidade de revestimento: a chapa pode continuar além do fim natural da modulação dos montantes
+   (ex.: pra amarrar com um canto/estrutura vizinha), numa medida qualquer (sem padrão fixo), só de um
+   lado por vez (esquerda/direita) e só numa face por vez (Externa/Interna) -- o lado/face de cima NÃO
+   precisam ser iguais entre si. Valor em mm, 0 = sem continuidade (comportamento de sempre). Pedido
+   confirmado pelo Carlos: "Estende a largura considerada no encaixe (recalcula pela otimização normal
+   -- a peça daquele lado fica maior ou surge outra peça)" -- ver extendedWall()/shiftLayoutX() em
+   solve(), que fazem exatamente isso. */
+function defaultCladExtend(){ return { ext: { left: 0, right: 0 }, int: { left: 0, right: 0 } }; }
+function migrateWallCladExtend(st){
+  (st.walls || []).forEach(w => { if (!w.cladExtend) w.cladExtend = defaultCladExtend(); else { w.cladExtend.ext = w.cladExtend.ext || { left: 0, right: 0 }; w.cladExtend.int = w.cladExtend.int || { left: 0, right: 0 }; } });
+}
+/* "Parede virtual" mais larga (W + extLeft + extRight), com as aberturas deslocadas pra compensar --
+   roda-se a MESMA calculateLayout() sem nenhuma modificação nela, só alimentando um retângulo maior.
+   extLeft/extRight nunca viram negativos aqui (campo recusa valor < 0 na validação). */
+function extendedWall(wall, extL, extR){
+  if (!extL && !extR) return wall;
+  return Object.assign({}, wall, { w: wall.w + extL + extR, openings: wall.openings.map(o => Object.assign({}, o, { x: o.x + extL })) });
+}
+/* Devolve o resultado de calculateLayout() pro referencial REAL da parede (desfaz o deslocamento de
+   extendedWall): todo X absoluto (peças, corpo/recorte de cada peça, colunas) volta "dx" pra trás. Y
+   (fiadas) nunca muda -- a continuidade é sempre lateral. Peças podem sair com x<0 (estendeu à
+   esquerda) ou x+w>wall.w (estendeu à direita) de propósito -- é a peça "ficando maior" pedida. */
+function shiftLayoutX(lay, dx){
+  if (!dx) return lay;
+  const shiftRect = r => Object.assign({}, r, { x0: r.x0 + dx, x1: r.x1 + dx });
+  return Object.assign({}, lay, {
+    rowCols: lay.rowCols.map(cols => cols.map(c => ({ a: c.a + dx, b: c.b + dx }))),
+    pieces: lay.pieces.map(p => Object.assign({}, p, { x: p.x + dx }, p.body ? { body: p.body.map(shiftRect), voids: p.voids.map(shiftRect) } : {}))
+  });
+}
+/* Campos de "Montagem" que podem ser sobrescritos por parede (o resto -- sentido da chapa, espessura
+   de corte, girar peças, reaproveitar sobras, sobra mínima reaproveitável -- afeta o encaixe/nesting
+   compartilhado entre TODAS as paredes de uma vez e por isso continua só do projeto). Ao ligar a
+   sobrescrita numa parede, wall.mont nasce como uma cópia dos valores atuais do projeto -- a partir
+   daí é independente (editar o padrão do projeto não muda mais essa parede), mesmo princípio já usado
+   em wall.stagger. */
+function wallMontDefaults(P){
+  return { start: P.start, studs: P.studs, studsCustom: P.studsCustom, showStuds: P.showStuds, gapV: P.gapV, gapH: P.gapH, floorGap: P.floorGap, cornerClear: P.cornerClear, tol: P.tol };
+}
+/* Montagem EFETIVA desta parede: os campos próprios (wall.mont), quando ligados, por cima do padrão
+   do projeto (P) -- usada tanto no cálculo (solve()) quanto nas validações e nos textos de relatório,
+   pra nunca haver dois lugares com regras divergentes sobre qual valor "vale" pra uma parede. */
+function effMontP(wall, P){ return (wall.montOverride && wall.mont) ? Object.assign({}, P, wall.mont) : P; }
+/* Resumo textual da Montagem efetiva desta parede, pro relatório/PDF -- "padrão do projeto" quando
+   não há sobrescrita, ou um resumo compacto dos valores próprios quando há. */
+function wallMontLabel(wall, P){
+  if (!(wall.montOverride && wall.mont)) return 'padrão do projeto';
+  const M = wall.mont;
+  return 'própria: início ' + START_NAME[M.start].toLowerCase() + ' · ' + (M.studs > 0 ? 'montante a cada ' + mm(M.studs) + ' mm' : 'sem montante') + ' · junta V ' + mm(M.gapV) + ' mm · junta H ' + mm(M.gapH) + ' mm';
+}
+/* Resumo textual da continuidade de revestimento DESTA entrada (face) -- '' quando não há nenhuma. */
+function wallCladExtendLabel(wall){
+  const ce = wall.cladExtend; if (!ce) return '';
+  const ex = ce[wall.face || 'ext'] || {}, parts = [];
+  if (ex.left > 0) parts.push('+' + mm(ex.left) + ' mm esq.');
+  if (ex.right > 0) parts.push('+' + mm(ex.right) + ' mm dir.');
+  return parts.length ? 'continuidade ' + parts.join(' / ') : '';
+}
+function migrateWallMont(st){
+  (st.walls || []).forEach(w => { if (w.montOverride == null) w.montOverride = false; });
+}
 // Migração: antes o desencontro mínimo era um único valor do projeto (S.params.stagger), aplicado a
 // TODAS as paredes por igual -- o que forçava o mesmo valor em todas. Paredes salvas antes dessa
 // mudança não têm wall.stagger ainda; herdam o valor antigo do projeto uma única vez (preservando o
@@ -1236,7 +1337,6 @@ function renderInputs(){
     <div class="grid2" style="margin-top:10px">
       ${lenField('Junta vertical (lado a lado)', P.gapV, 'data-p="gapV"', 'mm')}
       ${lenField('Junta horizontal (entre fiadas)', P.gapH, 'data-p="gapH"', 'mm')}
-      ${lenField('Espessura de corte (serra ou diâmetro da fresa CNC)', P.kerf, 'data-p="kerf"', 'mm')}
     </div>
     <p class="hint">Desencontro mínimo das juntas: configurado por parede, no card "Paredes" acima (abra a parede desejada).</p>
     <div class="grid2" style="margin-top:10px">
@@ -1249,16 +1349,22 @@ function renderInputs(){
     </div>
     ${P.studs > 0 ? `<p class="hint">Com montantes, a chapa começa encostada na parede (pegando o montante inteiro) e a junta cai no eixo do montante. Quando a peça daquele lado do eixo sai <b>chapa inteira</b> (atinge o tamanho nominal, dentro da tolerância configurada) ela não é refilada (ex.: 2400 mm, não 2397 mm) e não perde nada na junta. Quando a peça precisa ser <b>recortada</b> para caber na modulação, ela sozinha cede a folga vertical (${mm(P.gapV)} mm) naquela junta.</p>` : ''}
     ${studsMode === 'custom' ? `<label class="check"><input type="checkbox" data-p="showStuds" ${P.showStuds ? 'checked' : ''}> Mostrar montantes no desenho</label>` : ''}
+    <p class="hint">Tolerância p/ contar como chapa inteira: configurada em "Configurações de usinagem" abaixo (vale para o projeto todo).</p>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2><span class="step">4</span>Configurações de usinagem</h2></div>
+    <div class="grid2">
+      ${lenField('Espessura de corte (serra ou diâmetro da fresa CNC)', P.kerf, 'data-p="kerf"', 'mm')}
+      ${lenField('Tolerância p/ contar como chapa inteira', P.tol, 'data-p="tol"', 'mm')}
+    </div>
+    <div class="grid2" style="margin-top:10px">
+      ${lenField('Sobra mínima reaproveitável', P.minRem, 'data-p="minRem"', 'mm')}
+    </div>
+    <label class="check"><input type="checkbox" data-p="rotate" ${P.rotate ? 'checked' : ''}> Permitir girar as peças no plano de corte (ignora o sentido da fibra/resistência da chapa)</label>
+    <label class="check"><input type="checkbox" data-p="share" ${P.share ? 'checked' : ''}> Reaproveitar sobras entre paredes do projeto</label>
     <hr class="sep">
-    <details class="adv"><summary>Ajustes avançados</summary>
-      <div class="grid2">
-        ${lenField('Tolerância p/ contar como chapa inteira', P.tol, 'data-p="tol"', 'mm')}
-        ${lenField('Sobra mínima reaproveitável', P.minRem, 'data-p="minRem"', 'mm')}
-      </div>
-      <label class="check"><input type="checkbox" data-p="rotate" ${P.rotate ? 'checked' : ''}> Permitir girar as peças no plano de corte (ignora o sentido da fibra/resistência da chapa)</label>
-      <label class="check"><input type="checkbox" data-p="share" ${P.share ? 'checked' : ''}> Reaproveitar sobras entre paredes do projeto</label>
-    </details>
-    <details class="adv"><summary>Programa de usinagem CNC (G-code)</summary>
+    <details class="adv" open><summary>Programa de usinagem CNC (G-code)</summary>
       <p class="hint" style="margin-top:0">Usado no botão "Baixar programa" de cada chapa, na aba Plano de corte. Os valores abaixo já vêm com os dados do arquivo de corte que você enviou (Rhino 3000S).</p>
       <div class="grid2">
         <label class="f"><span>Máquina</span><div class="inp"><input type="text" data-p="cncMachine" value="${esc(P.cncMachine || '')}"></div></label>
@@ -1297,7 +1403,7 @@ function renderInputs(){
     </details>
   </div>
   <div class="card">
-    <div class="card-h"><h2><span class="step">4</span>Revestimento <small style="font-weight:500;color:var(--muted)">(opcional)</small></h2></div>
+    <div class="card-h"><h2><span class="step">5</span>Revestimento <small style="font-weight:500;color:var(--muted)">(opcional)</small></h2></div>
     <label class="check" style="margin-top:0"><input type="checkbox" data-c="on" ${C.on ? 'checked' : ''}> Adicionar revestimento sobre a parede (ex.: gesso sobre o OSB)</label>
     ${C.on ? `
     <p class="hint">Usa as mesmas paredes e aberturas do cadastro. As juntas do revestimento respeitam a distância dos cantos das aberturas e ficam desencontradas das juntas do OSB.</p>
@@ -1354,8 +1460,57 @@ function renderWallForm(){
     </select></div></label>
     ${wStagMode === 'custom' && !(P.studs > 0) ? `<div style="margin-top:10px">${lenField('Deslocamento mínimo entre juntas desta parede', w.stagger, 'data-wall="stagger"', 'mm')}</div>` : ''}
     <hr class="sep">
+    <label class="check"><input type="checkbox" data-wall="montOverride" ${w.montOverride ? 'checked' : ''}> Usar configuração própria de montagem nesta parede (em vez do padrão do card "3 Montagem")</label>
+    ${w.montOverride ? wallMontFields(w) : '<p class="hint" style="margin:4px 0 0">Esta parede usa a configuração de "Montagem" do projeto (card acima). Marque para dar valores próprios a esta parede.</p>'}
+    <hr class="sep">
+    <h3 style="margin:0 0 6px">Continuidade de revestimento</h3>
+    <p class="hint" style="margin:0 0 10px">Por padrão, a chapa termina no último montante dentro da modulação. Use isto só quando ela precisar continuar ALÉM disso de um lado — ex.: pra amarrar com um canto ou estrutura vizinha, numa medida qualquer (sem padrão fixo). Entra na otimização normal (a peça daquele lado fica maior, ou surge outra peça) — não é só visual.</p>
+    ${wallCladExtendFields(w)}
+    <hr class="sep">
     <div class="card-h" style="margin-bottom:6px"><h3>Aberturas (portas e janelas)</h3><button class="btn ghost sm" data-act="addOp">+ Abertura</button></div>
     <div id="opList">${w.openings.length ? '' : '<p class="hint" style="margin:0">Nenhuma abertura. A posição Y é medida a partir do piso. O recuo é a distância entre a chapa e o vão osso (ex.: 10, 20, 30, 40 mm).</p>'}${w.openings.map(opRow).join('')}</div>`;
+}
+/* Campos de "Montagem" próprios desta parede (quando w.montOverride está ligado) -- mesmos campos do
+   card "3 Montagem" do projeto, só que lendo/gravando em w.mont em vez de S.params. Sentido da chapa,
+   espessura de corte, girar peças, reaproveitar sobras e sobra mínima reaproveitável NÃO aparecem aqui
+   de propósito: afetam o encaixe compartilhado entre todas as paredes de uma vez e continuam só do
+   projeto (ver comentário em wallMontDefaults/solve()). */
+function wallMontFields(w){
+  const M = w.mont || (w.mont = wallMontDefaults(S.params));
+  const studsMode = M.studsCustom ? 'custom' : ([0, 400, 600].includes(M.studs) ? String(M.studs) : 'custom');
+  return `
+    <div class="f" style="margin-top:10px"><span>Iniciar a montagem pela (nesta parede)</span>
+      <div class="seg" role="radiogroup" aria-label="Início da montagem desta parede">
+        ${[['left', 'Esquerda'], ['right', 'Direita'], ['center', 'Centro']].map(([v, l]) => `<label><input type="radio" name="wstart-${w.id}" data-wmont="start" value="${v}" ${M.start === v ? 'checked' : ''}><span>${l}</span></label>`).join('')}
+      </div></div>
+    <div class="grid2" style="margin-top:10px">
+      <label class="f"><span>Montantes (modulação, nesta parede)</span><div class="inp"><select data-wmont="studsMode" aria-label="Modulação dos montantes desta parede">
+        <option value="0" ${studsMode === '0' ? 'selected' : ''}>Sem montante</option><option value="400" ${studsMode === '400' ? 'selected' : ''}>A cada 400 mm</option><option value="600" ${studsMode === '600' ? 'selected' : ''}>A cada 600 mm</option><option value="custom" ${studsMode === 'custom' ? 'selected' : ''}>Outro valor</option></select></div></label>
+      ${studsMode === 'custom' ? lenField('Distância entre montantes', M.studs, 'data-wmont="studs"', 'mm') : `<label class="f"><span>Mostrar montantes no desenho</span><div class="inp"><select data-wmont="showStuds"><option value="1" ${M.showStuds ? 'selected' : ''}>Sim</option><option value="0" ${!M.showStuds ? 'selected' : ''}>Não</option></select></div></label>`}
+    </div>
+    <div class="grid2" style="margin-top:10px">
+      ${lenField('Junta vertical (nesta parede)', M.gapV, 'data-wmont="gapV"', 'mm')}
+      ${lenField('Junta horizontal (nesta parede)', M.gapH, 'data-wmont="gapH"', 'mm')}
+    </div>
+    <div class="grid2" style="margin-top:10px">
+      ${lenField('Folga do piso (nesta parede)', M.floorGap, 'data-wmont="floorGap"', 'mm')}
+      ${lenField('Distância mín. junta-canto (nesta parede)', M.cornerClear, 'data-wmont="cornerClear"', 'mm')}
+    </div>
+    <div class="grid2" style="margin-top:10px">
+      ${lenField('Tolerância p/ chapa inteira (nesta parede)', M.tol, 'data-wmont="tol"', 'mm')}
+    </div>
+    <p class="hint" style="margin:4px 0 0">Sentido da chapa, espessura de corte, girar peças e reaproveitar sobras continuam só do projeto (card "4 Configurações de usinagem") — todas as paredes compartilham o mesmo encaixe de chapas.</p>`;
+}
+/* Campos de "Continuidade de revestimento" desta parede (w.cladExtend) -- Face Interna só aparece
+   quando a parede tem as duas faces (sem "duas faces" só existe uma camada, e ela conta como Externa). */
+function wallCladExtendFields(w){
+  const CE = w.cladExtend || (w.cladExtend = defaultCladExtend());
+  const faceBlock = (key, label) => `
+    <div class="grid2" style="margin-top:10px">
+      ${lenField('Continuidade à esquerda — ' + label, CE[key].left || 0, `data-wext="${key}.left"`, 'mm')}
+      ${lenField('Continuidade à direita — ' + label, CE[key].right || 0, `data-wext="${key}.right"`, 'mm')}
+    </div>`;
+  return faceBlock('ext', 'Face Externa') + (w.twoFaces ? faceBlock('int', 'Face Interna') : '');
 }
 function opRow(o){
   return `<div class="op-row" data-opid="${o.id}">
@@ -1380,6 +1535,7 @@ document.addEventListener('change', e => {
   else if (t.dataset.wall){
     if (t.dataset.wall === 'name'){ w.name = t.value.trim() || 'Parede'; }
     else if (t.dataset.wall === 'twoFaces'){ w.twoFaces = t.checked; renderWallForm(); }
+    else if (t.dataset.wall === 'montOverride'){ w.montOverride = t.checked; if (w.montOverride && !w.mont) w.mont = wallMontDefaults(S.params); renderWallForm(); }
     else if (t.dataset.wall === 'staggerMode'){
       if (t.value === 'custom'){ w.staggerCustom = true; if (!(w.stagger > 0)) w.stagger = 500; }
       else { w.staggerCustom = false; w.stagger = Number(t.value); }
@@ -1387,6 +1543,15 @@ document.addEventListener('change', e => {
     }
     else commitNumber(t, v => { w[t.dataset.wall] = v; });
     renderWallList();
+  } else if (t.dataset.wmont){
+    const k = t.dataset.wmont, M = w.mont || (w.mont = wallMontDefaults(S.params));
+    if (k === 'start') M.start = t.value;
+    else if (k === 'studsMode'){ if (t.value === 'custom'){ M.studsCustom = true; if (!(M.studs > 0)) M.studs = 500; } else { M.studsCustom = false; M.studs = Number(t.value); } renderWallForm(); }
+    else if (k === 'showStuds') M.showStuds = t.type === 'checkbox' ? t.checked : t.value === '1';
+    else commitNumber(t, v => { M[k] = v; });
+  } else if (t.dataset.wext){
+    const [face, side] = t.dataset.wext.split('.'), CE = w.cladExtend || (w.cladExtend = defaultCladExtend());
+    commitNumber(t, v => { CE[face][side] = v; });
   } else if (t.dataset.op){
     const o = w.openings.find(x => x.id === t.closest('.op-row').dataset.opid); if (!o) return;
     const f = t.dataset.op;
@@ -1512,6 +1677,10 @@ function resultsBlock(layer){
         return `<br>Desencontro entre fiadas obtido: <b>${mm(got)} mm</b> (mínimo pedido: ${mm(target)} mm${got < target - 0.5 ? ' — não foi possível atingir em alguma parede' : got > target + 0.5 ? ' — a melhor opção que cumpre o mínimo' : ''}).`; })()
     : '<br>Desencontro mínimo das juntas: valor configurado por parede (varia entre as paredes deste projeto) — veja os avisos abaixo.';
   const layerLine = P.isClad && isFinite(m.minLayer) && P.layerOff > 0 ? `<br>Menor distância entre juntas do revestimento e do OSB: <b>${mm(m.minLayer)} mm</b> (mínimo pedido: ${mm(P.layerOff)} mm${m.minLayer < P.layerOff - 0.5 ? ' — não foi possível atingir nesta parede' : ''}).` : '';
+  const montOverrideWalls = r.entries.filter(e => e.wall.montOverride && e.wall.mont).map(e => e.wall.name);
+  const montLine = montOverrideWalls.length ? `<br>Montagem própria (diferente do padrão do projeto) em: <b>${Array.from(new Set(montOverrideWalls)).join(', ')}</b> — veja os detalhes na tabela "Paredes" do relatório.` : '';
+  const cladExtWalls = r.entries.filter(e => wallCladExtendLabel(e.wall)).map(e => `${e.wall.name} (${wallCladExtendLabel(e.wall)})`);
+  const cladExtLine = cladExtWalls.length ? `<br>Continuidade de revestimento ativa em: <b>${cladExtWalls.join('; ')}</b>.` : '';
   // amarração entre Face Externa e Face Interna (juntas verticais desencontradas, tipo tijolinho) -- usa o
   // mesmo valor "desencontro mínimo das juntas" cadastrado por parede (wall.stagger), reaproveitado a
   // pedido do Carlos; só existe em paredes "duas faces" com esse campo > 0.
@@ -1533,7 +1702,7 @@ function resultsBlock(layer){
   </div>
   <div class="note info">Configuração usada: <b>${ORIENT_NAME[r.orient]}</b>, início pela <b>${START_NAME[r.start].toLowerCase()}</b>, chapa ${esc(R.mat.name)} (${matDimsLabel(R.mat)})${P.studs > 0 ? `, montantes a cada ${mm(P.studs)} mm` : ''}.
     ${P.orientation === 'auto' ? ' O modo automático testou as duas orientações e manteve a que usa menos chapas.' : ''}
-    ${stagLine}${layerLine}${faceStagLine}
+    ${stagLine}${layerLine}${faceStagLine}${montLine}${cladExtLine}
     ${better ? `<br>${why}: <b>${better.r.metrics.nSheets} chapas</b> (${ORIENT_NAME[better.o].split(' (')[0].toLowerCase()}, início pela ${START_NAME[better.st].toLowerCase()}). <button class="btn ghost sm" data-apply="${better.o}|${better.st}" data-layer="${layer}">Aplicar</button>` : ''}</div>
   ${warn.length ? `<div class="note warn"><ul>${warn.map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
   <div>
@@ -1594,9 +1763,19 @@ function renderWall(entry, r, opts){
   // parede", e a gravação tem que sair sempre legível, nunca espelhada.
   const mirror = !!(opts.mirror || wall.face === 'int');
   const mx = x => mirror ? W - x : x;
-  const big = Math.max(W, H), mg = big * 0.075, fs = big / 55;
+  // Continuidade de revestimento (ver extendedWall()/shiftLayoutX() em solve()): quando ligada nesta
+  // face, as peças podem desenhar com x<0 ou x+w>W de propósito -- a tela/canvas precisa crescer pra
+  // acompanhar, com a faixa extra marcada visualmente (tracejada, cor de destaque) pra ficar claro que é
+  // uma continuidade além da parede nominal, não um erro de desenho.
+  const ceFace = (wall.cladExtend && wall.cladExtend[wall.face || 'ext']) || { left: 0, right: 0 };
+  const extL = ceFace.left || 0, extR = ceFace.right || 0;
+  const big = Math.max(W + extL + extR, H), mg = big * 0.075, fs = big / 55;
   let geo = `<rect x="0" y="0" width="${W}" height="${H}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${fs * 0.1}"/>`;
   let texts = '';
+  if (extL > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extL)} mm à esquerda</title><rect x="${-extL}" y="0" width="${extL}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
+  if (extR > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extR)} mm à direita</title><rect x="${W}" y="0" width="${extR}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
+  if (extL > 0) texts += `<text x="${mx(-extL / 2)}" y="${H / 2}" text-anchor="middle" font-size="${fs * 0.75}" font-weight="700" fill="var(--accent)" opacity=".9">continuidade +${mm(extL)} mm</text>`;
+  if (extR > 0) texts += `<text x="${mx(W + extR / 2)}" y="${H / 2}" text-anchor="middle" font-size="${fs * 0.75}" font-weight="700" fill="var(--accent)" opacity=".9">continuidade +${mm(extR)} mm</text>`;
   lay.pieces.forEach(p => {
     const rects = pieceRects(p), fill = p.whole ? 'var(--whole)' : 'var(--cut)', lb = biggestRect(rects), tag = shapeTag(p.shape);
     geo += `<g><title>Chapa ${p.label}${p.whole ? ' (inteira)' : ' (peça cortada' + (p.shapeDesc ? ' · ' + p.shapeDesc : '') + ')'} · ${mm(p.w)} × ${mm(p.h)} mm</title>`;
@@ -1613,8 +1792,9 @@ function renderWall(entry, r, opts){
       if (lb.h > fs * 6 && lb.w > fs * 4) texts += `<text x="${cx}" y="${cy + fs * 1.7}" text-anchor="middle" dominant-baseline="middle" font-size="${fs * 0.7}" fill="var(--ink)" opacity=".75">${l3}</text>`;
     }
   });
-  if (S.params.showStuds && S.params.studs > 0 && !opts.noStuds){
-    const M = S.params.studs, axes = studAxes(W, M, r.start);
+  const wM = effMontP(wall, S.params), wSt = (wall.montOverride && wall.mont && wall.mont.start) ? wall.mont.start : r.start;
+  if (wM.showStuds && wM.studs > 0 && !opts.noStuds){
+    const M = wM.studs, axes = studAxes(W, M, wSt);
     axes.forEach(x => { geo += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.1}" stroke-dasharray="${fs * 0.5} ${fs * 0.4}" opacity=".7"/>`; });
     // cota dos montantes: distância de cada um até a extremidade esquerda do desenho -- referência física
     // fixa (não depende de "esquerda/direita" de quem olha); na Face Interna, o desenho inteiro (linhas e
@@ -1625,7 +1805,7 @@ function renderWall(entry, r, opts){
       ${[0].concat(axes, [W]).map(x => `<line x1="${x}" y1="${dyM - tick}" x2="${x}" y2="${dyM + tick}"/>`).join('')}
     </g>`;
     axes.forEach(x => { texts += `<text x="${mx(x)}" y="${dyM + fs * 1.3}" text-anchor="middle" font-size="${fs * 0.6}" fill="var(--muted)">${fmtLen(x)}</text>`; });
-    studLeftover(W, M, r.start).forEach(lv => {
+    studLeftover(W, M, wSt).forEach(lv => {
       geo += `<rect x="${lv.from}" y="0" width="${lv.to - lv.from}" height="${H}" fill="var(--warn)" opacity=".1"/>`;
       const lx = mx((lv.from + lv.to) / 2), side = mirror ? (lv.side === 'esquerda' ? 'direita' : 'esquerda') : lv.side;
       texts += `<text x="${lx}" y="${dyM + fs * 2.3}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)">sobra da modulação: ${mm(lv.size)} mm (lado ${side})</text>`;
@@ -1655,7 +1835,11 @@ function renderWall(entry, r, opts){
     <text x="${W / 2}" y="${dy - fs * 0.6}" text-anchor="middle" font-size="${fs * 1.1}" stroke="none">${fmtLen(W)}</text>
     <text transform="translate(${dx - fs * 0.7} ${H / 2}) rotate(-90)" text-anchor="middle" font-size="${fs * 1.1}" stroke="none">${fmtLen(H)}</text></g>`;
   const body = mirror ? `<g transform="translate(${W},0) scale(-1,1)">${geo}</g>` : geo;
-  return `<svg class="wallsvg" viewBox="${-mg} ${-mg} ${W + 2 * mg} ${H + 2 * mg}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
+  // O transform de espelhar (x -> W-x) troca de lado a extensão na TELA: o que estende à esquerda no
+  // referencial real aparece à direita depois de espelhado, e vice-versa -- o viewBox tem que crescer
+  // do lado que a extensão REALMENTE vai aparecer na tela, não do lado do referencial real.
+  const vbExtL = mirror ? extR : extL, vbExtR = mirror ? extL : extR;
+  return `<svg class="wallsvg" viewBox="${-vbExtL - mg} ${-mg} ${W + vbExtL + vbExtR + 2 * mg} ${H + 2 * mg}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
     <defs><pattern id="hatchW" width="${fs * 0.9}" height="${fs * 0.9}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="${fs * 0.9}" height="${fs * 0.9}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 0.9}" stroke="var(--accent)" stroke-width="${fs * 0.1}"/></pattern></defs>
     ${body}${texts}${outer}${mirror ? `<text x="${W / 2}" y="${-mg * 0.85}" text-anchor="middle" font-size="${fs * 0.85}" font-weight="700" fill="var(--accent)">VISTA ESPELHADA — de frente para a Face Interna</text>` : ''}</svg>`;
 }
@@ -2091,6 +2275,8 @@ function applyLoadedProject(p){
   st.params = Object.assign(defaultState().params, st.params || {}); normClad(st);
   st.walls.forEach(w => w.openings.forEach(o => { if (!(o.margin >= 0)) o.margin = 10; }));
   migrateWallStagger(st);
+  migrateWallMont(st);
+  migrateWallCladExtend(st);
   S = st; if (!S.walls.length) S.walls = [newWall('P01', 3000, 3000)]; S.activeWall = S.walls[0].id; UI.wallId = S.activeWall;
   syncAll(); toast('Projeto aberto: ' + S.name);
 }
@@ -2158,14 +2344,14 @@ function generateReport(){
   return `<div class="rep">
     <h1>${esc(S.name)}</h1><div class="meta">Relatório de paginação de chapas${P.isClad ? ' — REVESTIMENTO sobre o OSB' : ''} · ${date}</div>
     <h2>Dados do projeto</h2>
-    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Desenc. mín. juntas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>
-      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`).join('')}</tbody></table>
+    <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Montagem</th><th class="n">Desenc. mín. juntas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>
+      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${esc(wallMontLabel(e.wall, P))}${wallCladExtendLabel(e.wall) ? '<br>' + esc(wallCladExtendLabel(e.wall)) : ''}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`).join('')}</tbody></table>
     <h2>Material e montagem</h2>
     <table><tbody>
       <tr><td>Chapa</td><td>${esc(R.mat.name)} (${esc(R.mat.type)}) · ${mm(R.mat.w)} × ${mm(R.mat.h)} mm · espessura ${fmtNum(R.mat.t, 1)} mm</td></tr>
-      <tr><td>Sentido / início</td><td>${ORIENT_NAME[r.orient]} · início pela ${START_NAME[r.start].toLowerCase()}</td></tr>
-      <tr><td>Juntas</td><td>${P.studs > 0 ? 'vertical no eixo do montante (' + mm(P.gapV) + ' mm só nas peças recortadas — chapa inteira não desconta)' : 'vertical ' + mm(P.gapV) + ' mm'} · horizontal ${mm(P.gapH)} mm · serra ${mm(P.kerf)} mm · folga do piso ${mm(P.floorGap || 0)} mm</td></tr>
-      <tr><td>Montantes</td><td>${P.studs > 0 ? 'a cada ' + mm(P.studs) + ' mm' : 'sem modulação'} · desencontro mínimo de juntas: por parede, veja a tabela acima</td></tr></tbody></table>
+      <tr><td>Sentido / início</td><td>${ORIENT_NAME[r.orient]} · início pela ${START_NAME[r.start].toLowerCase()} (padrão do projeto — sentido da chapa é único para todo o projeto; início e os demais campos de montagem podem ser próprios por parede, veja a tabela acima)</td></tr>
+      <tr><td>Juntas</td><td>${P.studs > 0 ? 'vertical no eixo do montante (' + mm(P.gapV) + ' mm só nas peças recortadas — chapa inteira não desconta)' : 'vertical ' + mm(P.gapV) + ' mm'} · horizontal ${mm(P.gapH)} mm · serra ${mm(P.kerf)} mm · folga do piso ${mm(P.floorGap || 0)} mm (padrão do projeto)</td></tr>
+      <tr><td>Montantes</td><td>${P.studs > 0 ? 'a cada ' + mm(P.studs) + ' mm' : 'sem modulação'} (padrão do projeto) · desencontro mínimo de juntas e montagem própria: por parede, veja a tabela acima</td></tr></tbody></table>
     <h2>Resultado</h2>
     <table><tbody>
       <tr><td>Chapas necessárias</td><td class="n"><b>${m.nSheets}</b> (${m.nWholeClean} inteiras sem corte, ${m.nSheets - m.nWholeClean} a cortar)</td><td>Área comprada</td><td class="n">${fmtA(m.nominal)}</td></tr>
@@ -3036,14 +3222,23 @@ document.addEventListener('change', e => {
 /* ---------- PDF vetorial (jsPDF) ---------- */
 const PDFC = { whole: [221, 184, 119], cut: [147, 199, 187], remn: [191, 227, 196], resid: [217, 223, 225], ink: [18, 38, 44], mut: [88, 108, 114], acc: [11, 92, 173], red: [179, 38, 30], line: [205, 215, 218] };
 function pdfWall(doc, x, y, boxW, boxH, ent, r){
-  const W = ent.wall.w, H = ent.wall.h, k = Math.min((boxW - 14) / W, (boxH - 8) / H), ox = x + 12, oy = y + 4;
+  const W = ent.wall.w, H = ent.wall.h;
+  // Continuidade de revestimento (ver renderWall): a caixa cresce pro lado certo pra caber a extensão.
+  const ceFace = (ent.wall.cladExtend && ent.wall.cladExtend[ent.wall.face || 'ext']) || { left: 0, right: 0 };
+  const extL = ceFace.left || 0, extR = ceFace.right || 0;
+  const mirror = ent.wall.face === 'int';
+  const vbExtL = mirror ? extR : extL, vbExtR = mirror ? extL : extR;   // lado em que a extensão aparece NA PÁGINA, depois do espelho
+  const k = Math.min((boxW - 14) / (W + vbExtL + vbExtR), (boxH - 8) / H), ox = x + 12 + vbExtL * k, oy = y + 4;
   // Mesmo espelhamento da vista em tela (ver renderWall): Face Interna desenhada invertida, pra bater com
   // o que o montador vê de pé na frente dela -- os dados (posição de peça/montante) continuam intactos,
   // só a posição X na página muda. mX() dá a coordenada X já em pts, de um retângulo (passe a largura
   // local lw) ou de um ponto/linha (lw=0); mC() faz o mesmo pra um X de CENTRO (usado em texto).
-  const mirror = ent.wall.face === 'int';
   const mX = (lx, lw) => ox + (mirror ? (W - lx - (lw || 0)) : lx) * k;
   const mC = cx => ox + (mirror ? (W - cx) : cx) * k;
+  if (extL > 0){ doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.25); doc.setLineDashPattern([1.4, 1], 0); doc.setFillColor(...PDFC.acc); doc.rect(mX(-extL, extL), oy, extL * k, H * k, 'D'); doc.setLineDashPattern([], 0);
+    doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(6.5); doc.text('+' + mm(extL) + ' mm', mX(-extL / 2, 0), oy + H * k / 2, { align: 'center' }); }
+  if (extR > 0){ doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.25); doc.setLineDashPattern([1.4, 1], 0); doc.rect(mX(W, extR), oy, extR * k, H * k, 'D'); doc.setLineDashPattern([], 0);
+    doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(6.5); doc.text('+' + mm(extR) + ' mm', mX(W + extR / 2, 0), oy + H * k / 2, { align: 'center' }); }
   doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.3); doc.setFillColor(255, 255, 255); doc.rect(ox, oy, W * k, H * k, 'FD');
   ent.lay.pieces.forEach(p => {
     const rs = pieceRects(p);
@@ -3054,9 +3249,10 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
       mergeCutSegs(unionOutline(rs), 0.01).forEach(c => doc.line(mX(c.x1, 0), oy + (H - c.y1) * k, mX(c.x2, 0), oy + (H - c.y2) * k));
     } else doc.rect(mX(p.x, p.w), oy + (H - p.y - p.h) * k, p.w * k, p.h * k, 'FD');
   });
-  if (S.params.showStuds && S.params.studs > 0){
+  const wM = effMontP(ent.wall, S.params), wSt = (ent.wall.montOverride && ent.wall.mont && ent.wall.mont.start) ? ent.wall.mont.start : r.start;
+  if (wM.showStuds && wM.studs > 0){
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.15); doc.setLineDashPattern([1.2, 1], 0);
-    studAxes(W, S.params.studs, r.start).forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k)); doc.setLineDashPattern([], 0);
+    studAxes(W, wM.studs, wSt).forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k)); doc.setLineDashPattern([], 0);
   }
   if (S.params.isClad){
     const av = avoidFor(S.params, ent.wall.id);
@@ -3150,14 +3346,14 @@ function buildPDF(){
   h2('Material e montagem');
   kv([['Chapa', R.mat.name + ' (' + R.mat.type + ')  ' + mm(R.mat.w) + ' x ' + mm(R.mat.h) + ' mm  esp. ' + fmtNum(R.mat.t, 1) + ' mm'].map((c, i) => i ? c : c),
     ['Sentido', (r.orient === 'standing' ? 'Em pé' : 'Deitada') + '  |  início pela ' + START_NAME[r.start].toLowerCase() + (P.studs > 0 ? '  |  montantes a cada ' + mm(P.studs) + ' mm' : '  |  sem montantes')],
-    ['Juntas', (P.studs > 0 ? 'vertical no eixo do montante (' + mm(P.gapV) + ' mm só nas recortadas)' : 'vertical ' + mm(P.gapV) + ' mm') + '  |  horizontal ' + mm(P.gapH) + ' mm  |  serra ' + mm(P.kerf) + ' mm  |  folga do piso ' + mm(P.floorGap || 0) + ' mm (desencontro mín. de juntas: por parede, veja a tabela "Paredes")']], [0, 22]);
+    ['Juntas', (P.studs > 0 ? 'vertical no eixo do montante (' + mm(P.gapV) + ' mm só nas recortadas)' : 'vertical ' + mm(P.gapV) + ' mm') + '  |  horizontal ' + mm(P.gapH) + ' mm  |  serra ' + mm(P.kerf) + ' mm  |  folga do piso ' + mm(P.floorGap || 0) + ' mm (padrão do projeto; início e montagem podem ser próprios por parede, veja a tabela "Paredes")']], [0, 22]);
   h2('Balanço de áreas');
   kv([['Área da parede (bruta)', fmtA(m.gross), 'Área comprada', fmtA(m.nominal)], ['Aberturas', fmtA(m.openArea), 'Área utilizada (peças)', fmtA(m.pieceArea)], ['Área a revestir', fmtA(m.net), 'Sobra total', fmtA(m.waste)],
     ['Folga do piso + juntas', fmtA(m.floorArea + m.jointArea), 'Sobra reaproveitável', fmtA(m.reusableArea)], ['Recuo ao redor das aberturas', fmtA(m.marginArea), 'Resíduo', fmtA(m.residueArea)],
     ['Aproveitamento (útil/comprada)', fmtP(m.util), 'Desperdício', fmtP(m.wastePct)], ['Parede bruta / comprada', fmtP(m.wallOverNominal), '', '']], [0, 52, 96, 140]);
   h2('Paredes');
-  table([{ t: 'Parede', w: 30 }, { t: 'Dimensões (mm)', w: 30, a: 'r' }, { t: 'Área bruta', w: 24, a: 'r' }, { t: 'Aberturas', w: 22, a: 'r' }, { t: 'Inteiras', w: 16, a: 'r' }, { t: 'Cortadas', w: 20, a: 'r' }, { t: 'Desenc. juntas', w: 20, a: 'r' }, { t: 'Sobra modulação', w: 24, a: 'r' }],
-    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-', leftoverLabel(e.wall, r)]));
+  table([{ t: 'Parede', w: 28 }, { t: 'Dimensões (mm)', w: 28, a: 'r' }, { t: 'Área bruta', w: 22, a: 'r' }, { t: 'Aberturas', w: 20, a: 'r' }, { t: 'Inteiras', w: 14, a: 'r' }, { t: 'Cortadas', w: 16, a: 'r' }, { t: 'Montagem', w: 18, a: 'r' }, { t: 'Desenc. juntas', w: 18, a: 'r' }, { t: 'Sobra modulação', w: 22, a: 'r' }],
+    r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, (e.wall.montOverride && e.wall.mont ? 'própria' : 'projeto') + (wallCladExtendLabel(e.wall) ? ' / ' + wallCladExtendLabel(e.wall) : ''), e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-', leftoverLabel(e.wall, r)]));
   // paginação de cada parede
   r.entries.forEach(e => {
     const ratio = e.wall.h / e.wall.w, boxW = PW - 2 * M, boxH = Math.min(118, Math.max(60, boxW * ratio));
