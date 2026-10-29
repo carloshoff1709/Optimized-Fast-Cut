@@ -1770,6 +1770,16 @@ function renderWall(entry, r, opts){
   const ceFace = (wall.cladExtend && wall.cladExtend[wall.face || 'ext']) || { left: 0, right: 0 };
   const extL = ceFace.left || 0, extR = ceFace.right || 0;
   const big = Math.max(W + extL + extR, H), mg = big * 0.075, fs = big / 55;
+  // Cota dos montantes + rótulo de "sobra da modulação" (lado) precisam de espaço reservado ABAIXO da
+  // parede, além da margem genérica "mg" -- sem isso esse texto cai bem na borda do viewBox e é cortado
+  // (bug reportado: "não aparece as cotas das vistas e que lado fica a sobra" ao imprimir o relatório).
+  // Reservar só quando há de fato régua de montante a desenhar, e um pouco mais quando há sobra a rotular.
+  const wM = effMontP(wall, S.params), wSt = (wall.montOverride && wall.mont && wall.mont.start) ? wall.mont.start : r.start;
+  const showStudRow = !!(wM.showStuds && wM.studs > 0 && !opts.noStuds);
+  const studAxesArr = showStudRow ? studAxes(W, wM.studs, wSt) : [];
+  const studLeftovers = showStudRow ? studLeftover(W, wM.studs, wSt) : [];
+  const studRowGap = mg * 0.42, studRowH = fs * 1.9, leftoverRowH = studLeftovers.length ? fs * 1.7 : 0;
+  const mgBot = showStudRow ? mg + studRowGap + studRowH + leftoverRowH : mg;
   let geo = `<rect x="0" y="0" width="${W}" height="${H}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${fs * 0.1}"/>`;
   let texts = '';
   if (extL > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extL)} mm à esquerda</title><rect x="${-extL}" y="0" width="${extL}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
@@ -1792,23 +1802,25 @@ function renderWall(entry, r, opts){
       if (lb.h > fs * 6 && lb.w > fs * 4) texts += `<text x="${cx}" y="${cy + fs * 1.7}" text-anchor="middle" dominant-baseline="middle" font-size="${fs * 0.7}" fill="var(--ink)" opacity=".75">${l3}</text>`;
     }
   });
-  const wM = effMontP(wall, S.params), wSt = (wall.montOverride && wall.mont && wall.mont.start) ? wall.mont.start : r.start;
-  if (wM.showStuds && wM.studs > 0 && !opts.noStuds){
-    const M = wM.studs, axes = studAxes(W, M, wSt);
+  if (showStudRow){
+    const axes = studAxesArr;
     axes.forEach(x => { geo += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.1}" stroke-dasharray="${fs * 0.5} ${fs * 0.4}" opacity=".7"/>`; });
-    // cota dos montantes: distância de cada um até a extremidade esquerda do desenho -- referência física
-    // fixa (não depende de "esquerda/direita" de quem olha); na Face Interna, o desenho inteiro (linhas e
-    // montantes) é espelhado, e os números/rótulos abaixo acompanham via mx(), pra bater com o que se vê.
-    const dyM = H + mg * 0.42, tick = fs * 0.35;
+    // cota dos montantes: distância de cada um até a extremidade esquerda do desenho, EXCETO quando a
+    // modulação começa pela direita -- nesse caso a cota também conta a partir da direita (pedido do
+    // Carlos: "quando a modulação for da direita para a esquerda, a cota da modulação também inicie da
+    // direita para a esquerda"), pra bater com o sentido físico em que o instalador está medindo/montando.
+    // Na Face Interna, o desenho inteiro (linhas e montantes) é espelhado, e os números/rótulos abaixo
+    // acompanham via mx(), pra bater com o que se vê -- isso é independente do sentido da modulação.
+    const dyM = H + studRowGap, tick = fs * 0.35;
     geo += `<g stroke="var(--muted)" stroke-width="${fs * 0.06}" fill="var(--muted)">
       <line x1="0" y1="${dyM}" x2="${W}" y2="${dyM}"/>
       ${[0].concat(axes, [W]).map(x => `<line x1="${x}" y1="${dyM - tick}" x2="${x}" y2="${dyM + tick}"/>`).join('')}
     </g>`;
-    axes.forEach(x => { texts += `<text x="${mx(x)}" y="${dyM + fs * 1.3}" text-anchor="middle" font-size="${fs * 0.6}" fill="var(--muted)">${fmtLen(x)}</text>`; });
-    studLeftover(W, M, wSt).forEach(lv => {
+    axes.forEach(x => { const d = wSt === 'right' ? W - x : x; texts += `<text x="${mx(x)}" y="${dyM + fs * 1.3}" text-anchor="middle" font-size="${fs * 0.6}" fill="var(--muted)">${fmtLen(d)}</text>`; });
+    studLeftovers.forEach(lv => {
       geo += `<rect x="${lv.from}" y="0" width="${lv.to - lv.from}" height="${H}" fill="var(--warn)" opacity=".1"/>`;
       const lx = mx((lv.from + lv.to) / 2), side = mirror ? (lv.side === 'esquerda' ? 'direita' : 'esquerda') : lv.side;
-      texts += `<text x="${lx}" y="${dyM + fs * 2.3}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)">sobra da modulação: ${mm(lv.size)} mm (lado ${side})</text>`;
+      texts += `<text x="${lx}" y="${dyM + studRowH + fs * 1.1}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)">sobra da modulação: ${mm(lv.size)} mm (lado ${side})</text>`;
     });
   }
   if (S.params.isClad){   // juntas do OSB (referência): o revestimento não pode alinhar com elas
@@ -1839,7 +1851,7 @@ function renderWall(entry, r, opts){
   // referencial real aparece à direita depois de espelhado, e vice-versa -- o viewBox tem que crescer
   // do lado que a extensão REALMENTE vai aparecer na tela, não do lado do referencial real.
   const vbExtL = mirror ? extR : extL, vbExtR = mirror ? extL : extR;
-  return `<svg class="wallsvg" viewBox="${-vbExtL - mg} ${-mg} ${W + vbExtL + vbExtR + 2 * mg} ${H + 2 * mg}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
+  return `<svg class="wallsvg" viewBox="${-vbExtL - mg} ${-mg} ${W + vbExtL + vbExtR + 2 * mg} ${H + mg + mgBot}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
     <defs><pattern id="hatchW" width="${fs * 0.9}" height="${fs * 0.9}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="${fs * 0.9}" height="${fs * 0.9}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 0.9}" stroke="var(--accent)" stroke-width="${fs * 0.1}"/></pattern></defs>
     ${body}${texts}${outer}${mirror ? `<text x="${W / 2}" y="${-mg * 0.85}" text-anchor="middle" font-size="${fs * 0.85}" font-weight="700" fill="var(--accent)">VISTA ESPELHADA — de frente para a Face Interna</text>` : ''}</svg>`;
 }
@@ -3250,9 +3262,10 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
     } else doc.rect(mX(p.x, p.w), oy + (H - p.y - p.h) * k, p.w * k, p.h * k, 'FD');
   });
   const wM = effMontP(ent.wall, S.params), wSt = (ent.wall.montOverride && ent.wall.mont && ent.wall.mont.start) ? ent.wall.mont.start : r.start;
-  if (wM.showStuds && wM.studs > 0){
+  const pdfShowStuds = !!(wM.showStuds && wM.studs > 0), pdfAxes = pdfShowStuds ? studAxes(W, wM.studs, wSt) : [], pdfLeftovers = pdfShowStuds ? studLeftover(W, wM.studs, wSt) : [];
+  if (pdfShowStuds){
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.15); doc.setLineDashPattern([1.2, 1], 0);
-    studAxes(W, wM.studs, wSt).forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k)); doc.setLineDashPattern([], 0);
+    pdfAxes.forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k)); doc.setLineDashPattern([], 0);
   }
   if (S.params.isClad){
     const av = avoidFor(S.params, ent.wall.id);
@@ -3279,12 +3292,26 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
   doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5);
   doc.text(mm(W) + ' mm', ox + W * k / 2, oy - 1, { align: 'center' });
   doc.text(mm(H) + ' mm', ox - 2, oy + H * k / 2, { align: 'center', angle: 90 });
+  // Cota dos montantes (mesma lógica de renderWall: conta a partir da direita quando a modulação começa
+  // pela direita) e, quando houver, o rótulo "sobra da modulação (lado ...)" -- mesma informação que o
+  // relatório impresso em HTML mostra, agora também no PDF exportado.
+  let belowY = oy + H * k;
+  if (pdfShowStuds){
+    doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.setFontSize(5.5);
+    pdfAxes.forEach(sx => { const d = wSt === 'right' ? W - sx : sx; doc.text(fmtLen(d), mC(sx), belowY + 4, { align: 'center' }); });
+    belowY += 5;
+    if (pdfLeftovers.length){
+      doc.setTextColor(200, 120, 0); doc.setFont('helvetica', 'bold'); doc.setFontSize(5.5);
+      pdfLeftovers.forEach(lv => { const side = mirror ? (lv.side === 'esquerda' ? 'direita' : 'esquerda') : lv.side; doc.text('sobra ' + mm(lv.size) + ' mm (' + side + ')', mC((lv.from + lv.to) / 2), belowY + 4, { align: 'center' }); });
+      belowY += 5;
+    }
+  }
   if (mirror){
     doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(7.5);
-    doc.text('VISTA ESPELHADA — de frente para a Face Interna', ox + W * k / 2, oy + H * k + 4, { align: 'center' });
-    return oy + H * k + 5;
+    doc.text('VISTA ESPELHADA — de frente para a Face Interna', ox + W * k / 2, belowY + 4, { align: 'center' });
+    return belowY + 5;
   }
-  return oy + H * k;
+  return belowY;
 }
 function pdfSheet(doc, x, y, boxW, boxH, s, r){
   const { W, H, spt, srect } = sheetAxes(r);
@@ -3357,7 +3384,7 @@ function buildPDF(){
   // paginação de cada parede
   r.entries.forEach(e => {
     const ratio = e.wall.h / e.wall.w, boxW = PW - 2 * M, boxH = Math.min(118, Math.max(60, boxW * ratio));
-    need(boxH + 16); h2('Paginação - ' + e.wall.name + '  (' + mm(e.wall.w) + ' x ' + mm(e.wall.h) + ' mm)');
+    need(boxH + 30); h2('Paginação - ' + e.wall.name + '  (' + mm(e.wall.w) + ' x ' + mm(e.wall.h) + ' mm)');
     const yEnd = pdfWall(doc, M, y, boxW, boxH, e, r); y = yEnd + 6;
   });
   // legenda
