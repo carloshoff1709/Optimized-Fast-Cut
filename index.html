@@ -1087,7 +1087,10 @@ function validate(S, mat){
     if (!P.isClad && w.cladExtend){
       [['ext', 'Face Externa'], ['int', 'Face Interna']].forEach(([k, lbl]) => {
         const ex = w.cladExtend[k] || {};
-        ['left', 'right'].forEach(side => { const v = ex[side] || 0; if (!isFinite(v) || v < 0) e.push(`${n}: continuidade de revestimento inválida (${lbl}, lado ${side === 'left' ? 'esquerdo' : 'direito'}) -- use número ≥ 0.`); });
+        // Mesmo rótulo do campo na tela (ver wallCladExtendFields): na Face Interna (vista espelhada) o dado
+        // gravado em .left é o campo "à direita", e vice-versa -- a mensagem tem que citar o lado que o
+        // usuário VÊ no formulário, senão apontaria o campo errado.
+        ['left', 'right'].forEach(side => { const v = ex[side] || 0; const flip = k === 'int'; if (!isFinite(v) || v < 0) e.push(`${n}: continuidade de revestimento inválida (${lbl}, lado ${(side === 'left') !== flip ? 'esquerdo' : 'direito'}) -- use número ≥ 0.`); });
       });
     }
     for (let i = 0; i < w.openings.length; i++) for (let j = i + 1; j < w.openings.length; j++){
@@ -1210,12 +1213,17 @@ function wallMontLabel(wall, P){
   const M = wall.mont;
   return 'própria: início ' + START_NAME[M.start].toLowerCase() + ' · ' + (M.studs > 0 ? 'montante a cada ' + mm(M.studs) + ' mm' : 'sem montante') + ' · junta V ' + mm(M.gapV) + ' mm · junta H ' + mm(M.gapH) + ' mm';
 }
-/* Resumo textual da continuidade de revestimento DESTA entrada (face) -- '' quando não há nenhuma. */
+/* Resumo textual da continuidade de revestimento DESTA entrada (face) -- '' quando não há nenhuma.
+   Na Face Interna o DESENHO é espelhado (ver renderWall) -- o que está gravado em .left aparece à
+   DIREITA na vista de quem está de pé na frente dela, e vice-versa; aqui o texto já sai com a palavra
+   trocada nesse caso, pra bater com o que se vê na vista e com o rótulo do campo de entrada (ver
+   wallCladExtendFields), em vez do lado "cru" do dado interno. */
 function wallCladExtendLabel(wall){
   const ce = wall.cladExtend; if (!ce) return '';
+  const mirror = wall.face === 'int';
   const ex = ce[wall.face || 'ext'] || {}, parts = [];
-  if (ex.left > 0) parts.push('+' + mm(ex.left) + ' mm esq.');
-  if (ex.right > 0) parts.push('+' + mm(ex.right) + ' mm dir.');
+  if (ex.left > 0) parts.push('+' + mm(ex.left) + ' mm ' + (mirror ? 'dir.' : 'esq.'));
+  if (ex.right > 0) parts.push('+' + mm(ex.right) + ' mm ' + (mirror ? 'esq.' : 'dir.'));
   return parts.length ? 'continuidade ' + parts.join(' / ') : '';
 }
 function migrateWallMont(st){
@@ -1502,15 +1510,29 @@ function wallMontFields(w){
     <p class="hint" style="margin:4px 0 0">Sentido da chapa, espessura de corte, girar peças e reaproveitar sobras continuam só do projeto (card "4 Configurações de usinagem") — todas as paredes compartilham o mesmo encaixe de chapas.</p>`;
 }
 /* Campos de "Continuidade de revestimento" desta parede (w.cladExtend) -- Face Interna só aparece
-   quando a parede tem as duas faces (sem "duas faces" só existe uma camada, e ela conta como Externa). */
+   quando a parede tem as duas faces (sem "duas faces" só existe uma camada, e ela conta como Externa).
+   Na Face Interna o DESENHO é espelhado (ver renderWall/mirror) pra bater com o que o montador vê de pé
+   na frente dela -- o que fica gravado em CE.int.left aparece à DIREITA nessa vista espelhada, e
+   vice-versa. Por isso, só pra este bloco, o RÓTULO do campo é trocado (o campo que grava em .left
+   chama-se "à direita" aqui, e o que grava em .right chama-se "à esquerda") -- o atributo data-wext (e
+   portanto o dado salvo) continua exatamente o mesmo; só o texto que o usuário lê muda, pra "direita"
+   no formulário já significar a direita de quem está de pé olhando pra essa face, igual à vista/desenho
+   logo abaixo -- sem isso, pra uma extensão aparecer à direita NA VISTA, seria preciso preencher o campo
+   rotulado "esquerda", o que gerou confusão (Carlos: "queria que a continuidade ficasse a minha direita
+   ... para isso acontecer na imagem tive que dizer que a mesma está na esquerda"). */
 function wallCladExtendFields(w){
   const CE = w.cladExtend || (w.cladExtend = defaultCladExtend());
-  const faceBlock = (key, label) => `
+  // A ordem dos dois campos na tela segue o lado VISTO (esquerda primeiro, direita depois), igual ao desenho:
+  // na Face Interna isso inverte a ordem dos campos (o que grava em .right vem primeiro, rotulado "à esquerda").
+  const faceBlock = (key, label, mirror) => {
+    const fLeft = lenField('Continuidade à ' + (mirror ? 'direita' : 'esquerda') + ' — ' + label, CE[key].left || 0, `data-wext="${key}.left"`, 'mm');
+    const fRight = lenField('Continuidade à ' + (mirror ? 'esquerda' : 'direita') + ' — ' + label, CE[key].right || 0, `data-wext="${key}.right"`, 'mm');
+    return `
     <div class="grid2" style="margin-top:10px">
-      ${lenField('Continuidade à esquerda — ' + label, CE[key].left || 0, `data-wext="${key}.left"`, 'mm')}
-      ${lenField('Continuidade à direita — ' + label, CE[key].right || 0, `data-wext="${key}.right"`, 'mm')}
-    </div>`;
-  return faceBlock('ext', 'Face Externa') + (w.twoFaces ? faceBlock('int', 'Face Interna') : '');
+      ${mirror ? fRight + fLeft : fLeft + fRight}
+    </div>${mirror ? '<p class="hint" style="margin:4px 0 0">Esquerda/direita aqui já consideram a vista espelhada da Face Interna — de pé, de frente para esta face.</p>' : ''}`;
+  };
+  return faceBlock('ext', 'Face Externa', false) + (w.twoFaces ? faceBlock('int', 'Face Interna', true) : '');
 }
 function opRow(o){
   return `<div class="op-row" data-opid="${o.id}">
@@ -1782,8 +1804,8 @@ function renderWall(entry, r, opts){
   const mgBot = showStudRow ? mg + studRowGap + studRowH + leftoverRowH : mg;
   let geo = `<rect x="0" y="0" width="${W}" height="${H}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${fs * 0.1}"/>`;
   let texts = '';
-  if (extL > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extL)} mm à esquerda</title><rect x="${-extL}" y="0" width="${extL}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
-  if (extR > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extR)} mm à direita</title><rect x="${W}" y="0" width="${extR}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
+  if (extL > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extL)} mm à ${mirror ? 'direita' : 'esquerda'}</title><rect x="${-extL}" y="0" width="${extL}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
+  if (extR > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extR)} mm à ${mirror ? 'esquerda' : 'direita'}</title><rect x="${W}" y="0" width="${extR}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
   if (extL > 0) texts += `<text x="${mx(-extL / 2)}" y="${H / 2}" text-anchor="middle" font-size="${fs * 0.75}" font-weight="700" fill="var(--accent)" opacity=".9">continuidade +${mm(extL)} mm</text>`;
   if (extR > 0) texts += `<text x="${mx(W + extR / 2)}" y="${H / 2}" text-anchor="middle" font-size="${fs * 0.75}" font-weight="700" fill="var(--accent)" opacity=".9">continuidade +${mm(extR)} mm</text>`;
   lay.pieces.forEach(p => {
@@ -2883,12 +2905,16 @@ function exportAllGcodeCollect(){
   const pdf = buildPDF();   // mesmo relatório de paginação do botão "Exportar PDF", no mesmo contexto de camada (OSB ou revestimento)
   return { folder, files, pdf };
 }
-// Estrutura do .zip pedida pelo Carlos: <Projeto>/ com o PDF (relatório de paginação) solto direto
-// nela, e dentro de <Projeto>/Usinagem_OSB/ os programas de usinagem (G-code) de cada chapa.
+// Estrutura do .zip ajustada a pedido do Carlos ("muitas pastas dentro de pastas" trava a leitura do
+// pendrive no controlador da CNC): o MENOR número de pastas possível, mantendo OSB e cimentícia
+// organizados -- uma única pasta <Projeto>/ (ou <Projeto>_revest/ na camada de revestimento), com o
+// PDF e TODOS os programas de usinagem (G-code) soltos direto nela, sem subpasta nenhuma; o nome de
+// cada arquivo já carrega o material (prefixo "_revest" vindo de `folder`) e o número da chapa, então
+// dá pra distinguir OSB de cimentícia só pelo nome, sem precisar de uma pasta a mais pra cada um.
 async function zipAndSaveGcode({ folder, files, pdf }){
   if (typeof JSZip === 'undefined'){ toast('Não foi possível carregar o compactador de arquivos (.zip). Verifique a conexão e tente de novo.'); return; }
-  const zip = new JSZip(), proj = zip.folder(folder), usin = proj.folder('Usinagem_OSB');
-  files.forEach(f => usin.file(f.name, f.content));
+  const zip = new JSZip(), proj = zip.folder(folder);
+  files.forEach(f => proj.file(f.name, f.content));
   proj.file(pdf.fname, pdf.blob);
   toast('Compactando ' + files.length + ' programa(s) + relatório...');
   try {
