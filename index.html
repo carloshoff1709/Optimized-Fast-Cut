@@ -327,8 +327,16 @@ function calculateWaste(pieceArea, nominal){ return nominal > 0 ? (nominal - pie
 /* forb: zonas proibidas para o CENTRO de uma junta, lista de intervalos abertos [lo, hi] (mesmo sistema
    de coordenadas do trecho). Usadas para manter as juntas longe dos cantos das aberturas.           */
 function inForb(j, forb){ for (let i = 0; i < forb.length; i++){ if (j > forb[i][0] + EPS && j < forb[i][1] - EPS) return forb[i]; } return null; }
-function buildSpan(len, size, g, M, axisOrigin, lead, forb, tol){
+/* lim = { lo, hi }: intervalo (no mesmo sistema de coordenadas do trecho) em que EXISTE montante de
+   verdade. Sem continuidade de revestimento, é o trecho todo (lo = -Infinity, hi = len -- comportamento
+   de sempre). Com continuidade (a chapa passa do último montante pro lado de fora da parede), o trecho
+   "len" é maior que a parede real e a zona da extensão NÃO tem montante: nenhuma junta pode cair lá
+   (senão sobraria uma tira de chapa sem apoio, como no PDF MI-2-10 do Carlos) -- só montante dentro de
+   (lo, hi) serve de eixo de junta. A grade de montantes em si (axisOrigin) é ancorada na parede REAL, não
+   na borda do trecho -- ver buildAxis().                                                              */
+function buildSpan(len, size, g, M, axisOrigin, lead, forb, tol, lim){
   forb = forb || []; tol = tol || 0;
+  const lo = lim && lim.lo != null ? lim.lo : -Infinity, hi = lim && lim.hi != null ? lim.hi : len;
   const out = []; let s = 0, first = true, guard = 0;
   while (s < len - EPS && guard++ < 500){
     const remaining = len - s;
@@ -343,6 +351,7 @@ function buildSpan(len, size, g, M, axisOrigin, lead, forb, tol){
       else { end = s + Math.min(lead, size); c = end + g / 2; next = end + g; }
       if (end >= len - EPS){ end = len; next = len; }
       else if (inForb(c, forb)) return null;                // 1ª junta cairia perto de um canto
+      else if (M > 0 && ((hi < len && c >= hi - 0.5) || (lo > -Infinity && c <= lo + 0.5))) return null;   // 1ª junta cairia fora dos montantes reais (zona da continuidade)
     } else if (remaining <= size + EPS){ end = len; next = len; }
     else if (M > 0){
       let bestB = null;
@@ -350,8 +359,8 @@ function buildSpan(len, size, g, M, axisOrigin, lead, forb, tol){
       for (let k = kStart; k < kStart + 400; k++){
         const b = axisOrigin + k * M;
         if (b - s > size + EPS) break;
-        if (b - s > 1 && b < len && !inForb(b, forb)) bestB = b;   // eixo de montante só serve se não cair perto de um canto
-        if (b >= len) break;
+        if (b - s > 1 && b > lo + 0.5 && b < hi && !inForb(b, forb)) bestB = b;   // eixo de montante só serve se existir de verdade (dentro da parede real) e não cair perto de um canto
+        if (b >= hi) break;
       }
       if (bestB == null) return null;                       // chapa menor que a modulação
       const wholeHere = (bestB - s) >= size - tol - EPS;      // chega no tamanho nominal -- não desconta folga aqui
@@ -369,13 +378,20 @@ function buildSpan(len, size, g, M, axisOrigin, lead, forb, tol){
   return out;
 }
 
-/* Divide a largura da parede conforme o "sentido de início" (esquerda | direita | centro). */
-function buildAxis(len, size, g, M, start, lead, forb, tol){
-  forb = forb || [];
+/* Divide a largura da parede conforme o "sentido de início" (esquerda | direita | centro).
+   eL / eR = continuidade de revestimento (mm) à esquerda / direita: "len" aqui já é a largura da parede
+   VIRTUAL (parede real + eL + eR, ver extendedWall()). A modulação dos montantes pertence à parede REAL
+   -- a continuidade NÃO conta pro início da modulação (pedido do Carlos: "a Continuidade de revestimento
+   não faz parte, ou seja não conta para início da modulação") --, então a grade é ancorada na borda REAL
+   do lado de início (à esquerda: eL; à direita: eR; ao centro: no centro REAL da parede) e só montantes
+   dentro da parede real podem receber junta (a zona da extensão não tem montante).                    */
+function buildAxis(len, size, g, M, start, lead, forb, tol, eL, eR){
+  forb = forb || []; eL = eL || 0; eR = eR || 0;
   if (len <= size + EPS) return [{ a: 0, b: len }];
-  if (start === 'left') return buildSpan(len, size, g, M, 0, lead, forb, tol);
+  if (start === 'left') return buildSpan(len, size, g, M, eL, lead, forb, tol, { lo: eL > 0 ? eL : -Infinity, hi: len - eR });
   if (start === 'right'){
-    const r = buildSpan(len, size, g, M, 0, lead, forb.map(f => [len - f[1], len - f[0]]), tol);
+    // espelhado (x' = len - x): a borda real da direita fica em x' = eR, e a da esquerda em x' = len - eL
+    const r = buildSpan(len, size, g, M, eR, lead, forb.map(f => [len - f[1], len - f[0]]), tol, { lo: eR > 0 ? eR : -Infinity, hi: len - eL });
     return r && r.map(p => ({ a: len - p.b, b: len - p.a })).reverse();
   }
   // centro: junta no meio da parede, duas metades (espelhadas quando não há zonas proibidas). Com
@@ -383,14 +399,19 @@ function buildAxis(len, size, g, M, start, lead, forb, tol){
   // coberto pelo pedido novo do Carlos, que falou especificamente do eixo do montante repetido pela
   // fiada); as juntas RECORTADAS calculadas dentro de cada metade (buildSpan, abaixo) já ganham a
   // folga normalmente, porque a folga real (g, não gC) é passada pra dentro de buildSpan.
+  // Com continuidade, a junta central fica no centro REAL da parede (cReal, em coordenadas da parede
+  // virtual) -- então as duas metades deixam de ser simétricas (hlLen = lado esquerdo + eL, hrLen = lado
+  // direito + eR). Sem continuidade (eL = eR = 0) isso se reduz exatamente à conta de sempre.
   const gC = M > 0 ? 0 : g;
-  const half = (len - gC) / 2;
-  if (inForb(half + gC / 2, forb)) return null;              // a junta central cairia perto de um canto
-  const hl = buildSpan(half, size, g, M, -gC / 2, lead, forb.map(f => [half - f[1], half - f[0]]), tol);
-  const hr = forb.length ? buildSpan(half, size, g, M, -gC / 2, lead, forb.map(f => [f[0] - (half + gC), f[1] - (half + gC)]), tol) : hl;
+  const cReal = eL + (len - eL - eR) / 2;
+  const hlLen = cReal - gC / 2, hrLen = len - cReal - gC / 2;
+  if (hlLen <= EPS || hrLen <= EPS) return null;
+  if (inForb(hlLen + gC / 2, forb)) return null;             // a junta central cairia perto de um canto
+  const hl = buildSpan(hlLen, size, g, M, -gC / 2, lead, forb.map(f => [hlLen - f[1], hlLen - f[0]]), tol, { hi: hlLen - eL });
+  const hr = (forb.length || eL !== eR) ? buildSpan(hrLen, size, g, M, -gC / 2, lead, forb.map(f => [f[0] - (hlLen + gC), f[1] - (hlLen + gC)]), tol, { hi: hrLen - eR }) : hl;
   if (!hl || !hr) return null;
-  const left = hl.map(p => ({ a: half - p.b, b: half - p.a })).reverse();
-  const right = hr.map(p => ({ a: half + gC + p.a, b: half + gC + p.b }));
+  const left = hl.map(p => ({ a: hlLen - p.b, b: hlLen - p.a })).reverse();
+  const right = hr.map(p => ({ a: hlLen + gC + p.a, b: hlLen + gC + p.b }));
   return left.concat(right);
 }
 function joints(cols){ return cols.slice(1).map((c, i) => (cols[i].b + c.a) / 2); }
@@ -399,12 +420,15 @@ function minJointDist(a, b){
   ja.forEach(x => jb.forEach(y => { m = Math.min(m, Math.abs(x - y)); }));
   return m;
 }
-function leadOptions(size, g, M, mode){
+/* ext = continuidade (mm) do lado em que a 1ª peça nasce (esquerda no início "left", direita no "right";
+   0 no centro, onde a 1ª peça sai da junta central): a 1ª peça ocupa "ext + k módulos" -- a extensão conta
+   no comprimento da peça (ela fica maior), mas não na grade de montantes (ver buildAxis).            */
+function leadOptions(size, g, M, mode, ext){
   if (M > 0) g = 0;
   const o = [null];
   if (M > 0){
-    const ao = mode === 'center' ? -g / 2 : 0;
-    for (let k = 1; k < 200; k++){ const e = ao + k * M - g / 2; if (e > size + EPS) break; if (e > 1) o.push(k); }
+    const ao = mode === 'center' ? -g / 2 : 0, x0 = mode === 'center' ? 0 : (ext || 0);
+    for (let k = 1; k < 200; k++){ const e = ao + k * M - g / 2 + x0; if (e > size + EPS) break; if (e > 1) o.push(k); }
   } else [0.5, 1 / 3, 2 / 3, 0.25, 0.75].forEach(f => o.push(Math.round(size * f / 10) * 10));
   return o;
 }
@@ -612,6 +636,9 @@ function unionOutline(rects){
 
 function calculateLayout(wall, sw, sh, P, start){
   const W = wall.w, H = wall.h;
+  // Continuidade de revestimento (parede virtual, ver extendedWall()): W já inclui a extensão, mas a grade
+  // de montantes é da parede REAL -- eL/eR dizem pro buildAxis onde ela começa e onde ela termina.
+  const eL = wall.extL || 0, eR = wall.extR || 0;
   // 1ª fiada começa na folga do piso (ex.: 10 mm p/ drywall e OSB)
   const fg = P.floorGap > 0 ? P.floorGap : 0;
   const D = P.cornerClear > 0 ? P.cornerClear : 0;
@@ -634,13 +661,13 @@ function calculateLayout(wall, sw, sh, P, start){
     const altModes = P.studs > 0 ? [] : ['left', 'right', 'center'].filter(m => m !== start);
     const attempt = f => {
       if (r === 0 || !(P.stagger > 0)){
-        let c = buildAxis(W, sw, P.gapV, P.studs, start, null, f, P.tol);
-        if (!c && f.length) for (const m of altModes){ c = buildAxis(W, sw, P.gapV, P.studs, m, null, f, P.tol); if (c) break; }
+        let c = buildAxis(W, sw, P.gapV, P.studs, start, null, f, P.tol, eL, eR);
+        if (!c && f.length) for (const m of altModes){ c = buildAxis(W, sw, P.gapV, P.studs, m, null, f, P.tol, eL, eR); if (c) break; }
         return c ? { c, d: null } : null;
       }
       const prev = rowCols[r - 1]; let best = null, idx = 0;
-      const tryModes = modes => { for (const mode of modes) for (const lead of leadOptions(sw, P.gapV, P.studs, mode)){
-        const c = buildAxis(W, sw, P.gapV, P.studs, mode, lead, f, P.tol); idx++; if (!c) continue;
+      const tryModes = modes => { for (const mode of modes) for (const lead of leadOptions(sw, P.gapV, P.studs, mode, mode === 'right' ? eR : mode === 'left' ? eL : 0)){
+        const c = buildAxis(W, sw, P.gapV, P.studs, mode, lead, f, P.tol, eL, eR); idx++; if (!c) continue;
         const d = minJointDist(prev, c), viol = d < P.stagger - EPS;
         // ordem de preferência: cumpre o mínimo > sem tiras finas > menos peças > (cumprindo) desencontro o mais próximo do pedido,
         // (não cumprindo) o MAIOR desencontro possível > ordem de teste
@@ -1179,7 +1206,9 @@ function migrateWallCladExtend(st){
    extLeft/extRight nunca viram negativos aqui (campo recusa valor < 0 na validação). */
 function extendedWall(wall, extL, extR){
   if (!extL && !extR) return wall;
-  return Object.assign({}, wall, { w: wall.w + extL + extR, openings: wall.openings.map(o => Object.assign({}, o, { x: o.x + extL })) });
+  // extL/extR ficam gravados na parede virtual pra calculateLayout()/buildAxis() ancorarem a grade de
+  // montantes na parede REAL (a continuidade não conta pro início da modulação) -- ver buildAxis().
+  return Object.assign({}, wall, { w: wall.w + extL + extR, openings: wall.openings.map(o => Object.assign({}, o, { x: o.x + extL })), extL, extR });
 }
 /* Devolve o resultado de calculateLayout() pro referencial REAL da parede (desfaz o deslocamento de
    extendedWall): todo X absoluto (peças, corpo/recorte de cada peça, colunas) volta "dx" pra trás. Y
