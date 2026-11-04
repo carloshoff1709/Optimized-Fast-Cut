@@ -3391,6 +3391,87 @@ function pdfSheet(doc, x, y, boxW, boxH, s, r){
   doc.setFillColor(...PDFC.acc); doc.circle(x, y + H * k, 0.9, 'F'); doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(6); doc.text('X0 Y0', x + 1.6, y + H * k - 1);
   return { w: W * k, h: H * k };
 }
+/* Etiquetas dos kits (final do PDF) -- pedido do Carlos: "no final do pdf gerado o mesmo crie área de
+   12,5cm x 19cm com pontilhados e dentro delas vai ter o Nome do projeto em cima e abaixo o número da
+   parede. O mesmo terá que se ajustar [a] estas dimensões, o qual irei usar para organizar o kit de cada
+   parede." Uma etiqueta por PAREDE, na ordem das paredes do projeto -- exceto parede com "Revestir as
+   duas faces", que gera duas (Face Externa e Face Interna, rotuladas). O tamanho está todo em KIT_TAG (mm) -- mudar ali já reorganiza a página sozinho (escolhe retrato
+   ou paisagem, o que couber mais etiquetas por folha) e os textos se ajustam a qualquer tamanho. Com
+   12,5 x 19 cm cabem 2 por folha A4 em paisagem. Para o tamanho sair real, imprimir em 100%.            */
+const KIT_TAG = { w: 125, h: 190, gap: 14, minMargin: 6 };
+function kitTagGrid(){
+  const T = KIT_TAG;
+  const opts = [{ o: 'portrait', W: 210, H: 297 }, { o: 'landscape', W: 297, H: 210 }].map(pg => {
+    const cols = Math.max(1, Math.floor((pg.W - 2 * T.minMargin + T.gap) / (T.w + T.gap))), rows = Math.max(1, Math.floor((pg.H - 2 * T.minMargin + T.gap) / (T.h + T.gap)));
+    return Object.assign({ cols, rows, n: cols * rows }, pg);
+  });
+  return opts.sort((a, b) => b.n - a.n || (a.o === 'portrait' ? -1 : 1))[0];   // empate: retrato (como o resto do relatório)
+}
+// Ajusta um texto a uma caixa (largura x altura em mm): do maior corpo (maxPt) pro menor (minPt) até caber
+// em no máximo maxLines linhas; no menor corpo, se ainda não couber, trunca com reticências.
+function fitKitText(doc, text, maxW, maxH, maxPt, minPt, maxLines){
+  const PT = 0.3528;
+  for (let pt = maxPt; pt >= minPt; pt--){
+    doc.setFontSize(pt);
+    const lines = doc.splitTextToSize(String(text), maxW), lh = pt * PT * 1.15;
+    if (lines.length <= maxLines && lines.length * lh <= maxH && lines.every(l => doc.getTextWidth(l) <= maxW + 0.01)) return { lines, pt, lh };
+  }
+  doc.setFontSize(minPt);
+  const lines = doc.splitTextToSize(String(text), maxW).slice(0, maxLines).map(l => {
+    let cut = false; while (l.length > 1 && doc.getTextWidth(l + (cut ? '...' : '')) > maxW){ l = l.slice(0, -1); cut = true; }
+    return cut ? l.replace(/\s+$/, '') + '...' : l;
+  });
+  return { lines, pt: minPt, lh: minPt * PT * 1.15 };
+}
+function pdfKitTags(doc, walls, projName){
+  const T = KIT_TAG, g = kitTagGrid(), per = g.cols * g.rows, PT = 0.3528;
+  const x0 = (g.W - (g.cols * T.w + (g.cols - 1) * T.gap)) / 2, y0 = (g.H - (g.rows * T.h + (g.rows - 1) * T.gap)) / 2;
+  const first = doc.getNumberOfPages() + 1, pad = Math.min(10, T.w * 0.08), innerW = T.w - 2 * pad;
+  doc.setLineHeightFactor(1.15);
+  // Parede com "Revestir as duas faces" gera DUAS etiquetas (Face Externa, depois Face Interna), porque cada
+  // face tem a sua própria paginação/peças no kit; parede de uma face só continua com uma etiqueta, sem
+  // rótulo de face. (pedido do Carlos: "Irá ter a diferenciação de P1 interna e externa?")
+  const tags = [];
+  walls.forEach((w, i) => {
+    const nm = w.name || ('Parede ' + (i + 1));
+    if (w.twoFaces){ tags.push({ name: nm, face: 'ext' }); tags.push({ name: nm, face: 'int' }); }
+    else tags.push({ name: nm, face: null });
+  });
+  tags.forEach((w, i) => {
+    if (i % per === 0) doc.addPage('a4', g.o);
+    const k = i % per, x = x0 + (k % g.cols) * (T.w + T.gap), y = y0 + Math.floor(k / g.cols) * (T.h + T.gap), cx = x + T.w / 2;
+    // área pontilhada (o contorno É o limite de 12,5 x 19 cm): pontos redondos espaçados
+    doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.5); doc.setLineCap('round'); doc.setLineDashPattern([0.05, 2.2], 0);
+    doc.rect(x, y, T.w, T.h, 'S');
+    doc.setLineDashPattern([], 0); doc.setLineCap('butt'); doc.setLineWidth(0.2);
+    // em cima: nome do projeto (até 4 linhas, até 34 pt, sempre cabendo na largura da etiqueta)
+    doc.setFont('helvetica', 'bold'); doc.setTextColor(...PDFC.ink);
+    const zoneTop = y + pad + 4, nameH = T.h * 0.30;
+    const nm = fitKitText(doc, projName || 'Sem nome', innerW, nameH, 34, 10, 4);
+    doc.setFontSize(nm.pt); nm.lines.forEach((ln, li) => doc.text(ln, cx, zoneTop + nm.pt * PT * 0.8 + li * nm.lh, { align: 'center' }));
+    // embaixo: número/nome da parede, bem grande, centralizado no que sobra da etiqueta
+    //   (com rótulo de face, a parede ocupa só a faixa de cima e a face vai numa faixa própria no rodapé)
+    const hasFace = !!w.face;
+    const wTop = y + T.h * (hasFace ? 0.36 : 0.38), wH = hasFace ? T.h * 0.40 : T.h - T.h * 0.38 - pad - 4;
+    const wl = fitKitText(doc, w.name, innerW, wH, 130, 18, 2);
+    const blockH = wl.lines.length * wl.lh, bTop = wTop + (wH - blockH) / 2;
+    doc.setFontSize(wl.pt); wl.lines.forEach((ln, li) => doc.text(ln, cx, bTop + wl.pt * PT * 0.8 + li * wl.lh, { align: 'center' }));
+    if (hasFace){
+      // Face Externa: faixa só com contorno; Face Interna: faixa PRETA com texto branco -- dá pra separar
+      // os dois kits da mesma parede só de bater o olho na pilha.
+      const isInt = w.face === 'int', fx = x + pad, fw = innerW, fh = T.h * 0.14, fy = y + T.h * 0.78;
+      doc.setLineWidth(0.8);
+      if (isInt){ doc.setFillColor(...PDFC.ink); doc.roundedRect(fx, fy, fw, fh, 3, 3, 'F'); doc.setTextColor(255, 255, 255); }
+      else { doc.setDrawColor(...PDFC.ink); doc.roundedRect(fx, fy, fw, fh, 3, 3, 'S'); doc.setTextColor(...PDFC.ink); }
+      doc.setFont('helvetica', 'bold');
+      const fl = fitKitText(doc, isInt ? 'FACE INTERNA' : 'FACE EXTERNA', fw - 8, fh - 6, 40, 12, 1);
+      doc.setFontSize(fl.pt); doc.text(fl.lines[0], cx, fy + fh / 2 + fl.pt * PT * 0.35, { align: 'center' });
+      doc.setTextColor(...PDFC.ink); doc.setLineWidth(0.2);
+    }
+  });
+  return { first, g, x0 };
+}
+
 async function exportPDF(layer){
   if (!R){ toast('Corrija os dados antes de exportar.'); return; }
   if (!(window.jspdf && window.jspdf.jsPDF)){ toast('A biblioteca de PDF não carregou (sem internet?). Use "Imprimir" e salve como PDF.'); return; }
@@ -3473,8 +3554,20 @@ function buildPDF(){
     pdfSheet(doc, cx, rowTop + 6, cellW, cellH - 10, s, r);
     col++; if (col === 3){ col = 0; rowTop += cellH + 4; }
   });
-  // rodapé com paginação
-  const n = doc.getNumberOfPages(); for (let i = 1; i <= n; i++){ doc.setPage(i); doc.setFontSize(8); doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.text('Página ' + i + ' de ' + n, PW - M, 292, { align: 'right' }); doc.text('Desenvolvido por Carlos Hoff - Todos os direitos reservados.', M, 292); }
+  // etiquetas dos kits (uma por parede) -- páginas extras no FINAL do PDF, ver pdfKitTags()
+  const nReport = doc.getNumberOfPages(), kit = pdfKitTags(doc, S.walls, S.name);
+  // rodapé com paginação (páginas do relatório) / aviso de impressão (páginas das etiquetas)
+  const n = doc.getNumberOfPages();
+  for (let i = 1; i <= n; i++){
+    doc.setPage(i); doc.setFontSize(8); doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal');
+    if (i <= nReport){ doc.text('Página ' + i + ' de ' + n, PW - M, 292, { align: 'right' }); doc.text('Desenvolvido por Carlos Hoff - Todos os direitos reservados.', M, 292); }
+    else {
+      // o aviso fica na faixa ENTRE as etiquetas (nunca dentro delas nem nas margens, onde a impressora corta), de lado
+      const T = KIT_TAG, g = kit.g, nx = g.cols > 1 ? kit.x0 + T.w + T.gap / 2 : kit.x0 + T.w + (g.W - kit.x0 - T.w) / 2;
+      const msg = 'Etiquetas dos kits - imprimir em 100% (tamanho real) - cada área pontilhada = ' + fmtNum(T.w / 10, 1) + ' x ' + fmtNum(T.h / 10, 1) + ' cm - Página ' + i + ' de ' + n;
+      doc.setFontSize(7); doc.text(msg, nx + 1, g.H / 2 + doc.getTextWidth(msg) / 2, { angle: 90 });
+    }
+  }
   const fname = (S.name || 'projeto').replace(/[^\w\-]+/g, '_') + (CUR_LAYER ? '_revest' : '') + '_paginacao.pdf';
   return { fname, blob: doc.output('blob') };
 }
