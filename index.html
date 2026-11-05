@@ -929,6 +929,7 @@ function solve(S, mat, orient, start, effort){
     const extE = ce.ext || { left: 0, right: 0 };
     const layRawE = calculateLayout(extendedWall(wall, extE.left || 0, extE.right || 0), sw, sh, wallP, wStart);
     if (layRawE.error) return { error: `${wall.name}: ${layRawE.error}` };
+    recuoOpeningNotes(wall, extE.left || 0, extE.right || 0).forEach(n => layRawE.warnings.push(n));
     const lay = shiftLayoutX(layRawE, -(extE.left || 0));     // Face Externa (ou parede normal, sem 2 faces), já no referencial real
     if (wall.twoFaces){
       const fe = faceWall(wall, 'ext'), fi = faceWall(wall, 'int');
@@ -953,6 +954,7 @@ function solve(S, mat, orient, start, effort){
       const wallPi = Object.assign({}, wallP, { faceAvoid, faceOff: wall.stagger || 0 });
       const layRawI = calculateLayout(extendedWall(wall, extI.left || 0, extI.right || 0), sw, sh, wallPi, wStart);
       if (layRawI.error) return { error: `${wall.name} (Face Interna): ${layRawI.error}` };
+      recuoOpeningNotes(wall, extI.left || 0, extI.right || 0).forEach(n => layRawI.warnings.push(n));
       const layI = shiftLayoutX(layRawI, -(extI.left || 0));
       // Pré-espelhar (só pro CORTE, nunca pra Vista da parede) o recorte de cada peça com vão perto --
       // ver mirrorPieceCutLocal() -- pra "gravação sempre à vista" sair geometricamente garantida, sem
@@ -1025,25 +1027,34 @@ function calculateRemnants(entries, sheets, sw, sh, P){
   m.sheetArea = sw * sh;
   m.nominal = m.nSheets * m.sheetArea;
   m.gross = physEntries.reduce((s, e) => s + calculateWallArea(e.wall), 0);
-  m.openArea = physEntries.reduce((s, e) => s + openingsArea(e.wall), 0);
-  m.net = m.gross - m.openArea;
+  // zona SEM revestimento (recuo do revestimento): fora da área a revestir; as aberturas descontadas são só as
+  // que caem na zona revestida (sem recuo: igual ao de sempre)
+  // (com "duas faces" cada face pode ter o SEU recuo: soma por face com peso 1/nº de faces da parede -- uma face = o valor
+  // dela; duas faces iguais = o mesmo valor de sempre; duas faces diferentes = a média)
+  const faceCnt = {}; entries.forEach(e => { faceCnt[e.realWallId] = (faceCnt[e.realWallId] || 0) + 1; });
+  const perWall = fn => entries.reduce((s, e) => s + fn(e) / faceCnt[e.realWallId], 0);
+  m.uncovered = perWall(e => uncoveredArea(e.wall, P));
+  m.openArea = perWall(e => openingsAreaCovered(e.wall, P));
+  m.net = m.gross - m.uncovered - m.openArea;
   m.pieceArea = 0; sheets.forEach(s => s.placed.forEach(pl => { m.pieceArea += plArea(pl); }));
   // Áreas de folga do piso e de recuo ao redor das aberturas, por união exata de retângulos (sem contar 2x
   // quando dois recuos se sobrepõem ou quando o recuo invade a folga do piso).
   m.floorArea = 0; m.marginArea = 0;
-  physEntries.forEach(e => {
-    const W = e.wall.w, H = e.wall.h, fg = P.floorGap > 0 ? P.floorGap : 0;
-    const ops = e.wall.openings.map(o => ({ x0: o.x, x1: o.x + o.w, y0: o.y, y1: o.y + o.h }));
-    const cuts = e.wall.openings.map(o => openingCutRect(o, W, H));
+  entries.forEach(e => {
+    const fw = 1 / faceCnt[e.realWallId];
+    const W = e.wall.w, H = e.wall.h, fg = P.floorGap > 0 ? P.floorGap : 0, cvx = wallCoverX(e.wall, P), Wc = cvx.x1 - cvx.x0;
+    const clipX = r => ({ x0: Math.max(r.x0, cvx.x0), x1: Math.min(r.x1, cvx.x1), y0: r.y0, y1: r.y1 }), inside = r => r.x1 - r.x0 > 0;   // só a zona revestida conta
+    const ops = e.wall.openings.map(o => clipX({ x0: o.x, x1: o.x + o.w, y0: o.y, y1: o.y + o.h })).filter(inside);
+    const cuts = e.wall.openings.map(o => clipX(openingCutRect(o, W, H))).filter(inside);
     const above = r => ({ x0: r.x0, x1: r.x1, y0: Math.max(r.y0, fg), y1: r.y1 }), below = r => ({ x0: r.x0, x1: r.x1, y0: r.y0, y1: Math.min(r.y1, fg) });
-    m.floorArea += Math.max(0, W * fg - rectsUnionArea(ops.map(below)));
-    m.marginArea += Math.max(0, rectsUnionArea(cuts.map(above)) - rectsUnionArea(ops.map(above)));
+    m.floorArea += fw * Math.max(0, Wc * fg - rectsUnionArea(ops.map(below)));
+    m.marginArea += fw * Math.max(0, rectsUnionArea(cuts.map(above)) - rectsUnionArea(ops.map(above)));
   });
   m.jointArea = Math.max(0, m.net - m.floorArea - m.marginArea - m.pieceArea);
   m.waste = Math.max(0, m.nominal - m.pieceArea);
   m.util = calculateUtilization(m.pieceArea, m.nominal);
   m.wastePct = calculateWaste(m.pieceArea, m.nominal);
-  m.wallOverNominal = m.nominal > 0 ? m.gross / m.nominal * 100 : 0;
+  m.wallOverNominal = m.nominal > 0 ? (m.gross - m.uncovered) / m.nominal * 100 : 0;
   m.reusableArea = 0; m.remnants = [];
   sheets.forEach(s => s.free.forEach(f => { if (f.reusable){ m.reusableArea += f.w * f.h; m.remnants.push({ sheet: s.no, w: f.w, h: f.h }); } }));
   m.residueArea = Math.max(0, m.waste - m.reusableArea);
@@ -1117,7 +1128,15 @@ function validate(S, mat){
         // Mesmo rótulo do campo na tela (ver wallCladExtendFields): na Face Interna (vista espelhada) o dado
         // gravado em .left é o campo "à direita", e vice-versa -- a mensagem tem que citar o lado que o
         // usuário VÊ no formulário, senão apontaria o campo errado.
-        ['left', 'right'].forEach(side => { const v = ex[side] || 0; const flip = k === 'int'; if (!isFinite(v) || v < 0) e.push(`${n}: continuidade de revestimento inválida (${lbl}, lado ${(side === 'left') !== flip ? 'esquerdo' : 'direito'}) -- use número ≥ 0.`); });
+        const flipE = k === 'int', ladoE = side => (side === 'left') !== flipE ? 'esquerdo' : 'direito';
+        ['left', 'right'].forEach(side => { const v = ex[side]; if (v != null && !isFinite(v)) e.push(`${n}: continuidade/recuo de revestimento inválido (${lbl}, lado ${ladoE(side)}) -- use um número (positivo = continuidade, negativo = recuo).`); });
+        // RECUO (valor negativo): o revestimento termina antes do fim da parede -- tem que sobrar parede revestida
+        const rlE = Math.max(0, -(ex.left || 0)), rrE = Math.max(0, -(ex.right || 0));
+        if (isFinite(rlE) && isFinite(rrE) && rlE + rrE > 0){
+          const cov = w.w - rlE - rrE;
+          if (cov < 100) e.push(`${n}: o recuo do revestimento (${lbl}) deixa só ${mm(Math.max(0, cov))} mm de parede revestida (a parede tem ${mm(w.w)} mm) -- reduza o recuo.`);
+          else if (wm.studs > 0 && ((w.montOverride && w.mont && w.mont.start) ? w.mont.start : P.start) === 'center' && (rlE >= w.w / 2 - 1 || rrE >= w.w / 2 - 1)) e.push(`${n}: com início da modulação pelo CENTRO, o recuo do revestimento (${lbl}) não pode passar do centro da parede (${mm(w.w / 2)} mm) -- mude o início para esquerda/direita ou reduza o recuo.`);
+        }
       });
     }
     for (let i = 0; i < w.openings.length; i++) for (let j = i + 1; j < w.openings.length; j++){
@@ -1197,18 +1216,61 @@ function newWall(name, w, h){ return { id: uid(), name, w, h, openings: [], stag
    confirmado pelo Carlos: "Estende a largura considerada no encaixe (recalcula pela otimização normal
    -- a peça daquele lado fica maior ou surge outra peça)" -- ver extendedWall()/shiftLayoutX() em
    solve(), que fazem exatamente isso. */
+// Continuidade/recuo do revestimento por face e por lado (mm): positivo = o revestimento avança além do último montante; NEGATIVO = RECUO (o revestimento termina antes do fim da parede, exatamente onde o valor cai, com um montante extra na borda); 0 = paginação pela parede.
 function defaultCladExtend(){ return { ext: { left: 0, right: 0 }, int: { left: 0, right: 0 } }; }
 function migrateWallCladExtend(st){
   (st.walls || []).forEach(w => { if (!w.cladExtend) w.cladExtend = defaultCladExtend(); else { w.cladExtend.ext = w.cladExtend.ext || { left: 0, right: 0 }; w.cladExtend.int = w.cladExtend.int || { left: 0, right: 0 }; } });
 }
 /* "Parede virtual" mais larga (W + extLeft + extRight), com as aberturas deslocadas pra compensar --
    roda-se a MESMA calculateLayout() sem nenhuma modificação nela, só alimentando um retângulo maior.
-   extLeft/extRight nunca viram negativos aqui (campo recusa valor < 0 na validação). */
+   extLeft/extRight POSITIVOS = continuidade (a parede virtual cresce). NEGATIVOS = RECUO (o revestimento
+   termina ANTES do fim da parede, ex.: só vai até perto da metade e o resto é fechado de outro jeito):
+   a parede virtual fica MAIS CURTA (largura = parede - recuo) e começa/termina na borda do revestimento. A
+   grade de montantes continua ancorada na parede REAL (ver buildAxis) e a borda do recuo recebe um montante
+   EXTRA (desenhado na vista) -- a borda fica exatamente onde o recuo cai, SEM ajustar ao montante mais
+   próximo (pedido do Carlos: "onde o recuo terminar, deverei adicionar um montante estratégico"). */
 function extendedWall(wall, extL, extR){
   if (!extL && !extR) return wall;
   // extL/extR ficam gravados na parede virtual pra calculateLayout()/buildAxis() ancorarem a grade de
   // montantes na parede REAL (a continuidade não conta pro início da modulação) -- ver buildAxis().
-  return Object.assign({}, wall, { w: wall.w + extL + extR, openings: wall.openings.map(o => Object.assign({}, o, { x: o.x + extL })), extL, extR });
+  const w2 = wall.w + extL + extR;
+  if (extL >= 0 && extR >= 0)       // só continuidade: nenhuma abertura sai da parede virtual (caminho de sempre)
+    return Object.assign({}, wall, { w: w2, openings: wall.openings.map(o => Object.assign({}, o, { x: o.x + extL })), extL, extR });
+  // Com RECUO: a origem da parede virtual é a borda do revestimento. Abertura (já com o "recuo das chapas")
+  // totalmente fora da zona revestida some; a que atravessa a borda é recortada na borda -- o recorte da peça
+  // na paginação usa exatamente esse retângulo, então fica igual ao de uma abertura que encosta no canto.
+  const ops = [];
+  wall.openings.forEach(o => {
+    const c = openingCutRect(Object.assign({}, o, { x: o.x + extL }), w2, wall.h);
+    if (c.x1 - c.x0 <= EPS || c.y1 - c.y0 <= EPS) return;
+    ops.push(Object.assign({}, o, { x: c.x0, y: c.y0, w: c.x1 - c.x0, h: c.y1 - c.y0, margin: 0 }));
+  });
+  return Object.assign({}, wall, { w: w2, openings: ops, extL, extR });
+}
+/* RECUO do revestimento desta entrada (valor NEGATIVO em cladExtend): quanto da parede, a partir de cada borda
+   REAL, fica SEM revestimento. Só vale pra camada principal (o revestimento sobre o OSB nunca lê cladExtend). */
+function wallRecuo(wall, P){
+  P = P || S.params;
+  if (P.isClad) return { l: 0, r: 0 };
+  const ce = wall.cladExtend && wall.cladExtend[wall.face || 'ext'];
+  return { l: Math.max(0, -((ce && ce.left) || 0)), r: Math.max(0, -((ce && ce.right) || 0)) };
+}
+function wallCoverX(wall, P){ const c = wallRecuo(wall, P); return { x0: c.l, x1: wall.w - c.r }; }
+function uncoveredArea(wall, P){ const c = wallRecuo(wall, P); return (c.l + c.r) * wall.h; }
+// área das aberturas que cai dentro da zona revestida (sem recuo = igual a openingsArea)
+function openingsAreaCovered(wall, P){
+  const c = wallRecuo(wall, P); if (!c.l && !c.r) return openingsArea(wall);
+  const x0 = c.l, x1 = wall.w - c.r;
+  return wall.openings.reduce((s, o) => s + Math.max(0, Math.min(o.x + o.w, x1) - Math.max(o.x, x0)) * o.h, 0);
+}
+function wallNetArea(wall, P){ return calculateWallArea(wall) - uncoveredArea(wall, P) - openingsAreaCovered(wall, P); }
+// Avisos de abertura que atravessa a borda do recuo (só a parte dentro da zona revestida entra na paginação).
+function recuoOpeningNotes(wall, extL, extR){
+  const rl = Math.max(0, -extL), rr = Math.max(0, -extR), out = [];
+  if (!rl && !rr) return out;
+  const x0 = rl, x1 = wall.w - rr;
+  wall.openings.forEach(o => { if ((o.x < x0 - EPS && o.x + o.w > x0 + EPS) || (o.x < x1 - EPS && o.x + o.w > x1 + EPS)) out.push(`A abertura ${o.name} atravessa a borda do revestimento (recuo) - só a parte dentro da zona revestida entra na paginação.`); });
+  return out;
 }
 /* Devolve o resultado de calculateLayout() pro referencial REAL da parede (desfaz o deslocamento de
    extendedWall): todo X absoluto (peças, corpo/recorte de cada peça, colunas) volta "dx" pra trás. Y
@@ -1250,10 +1312,13 @@ function wallMontLabel(wall, P){
 function wallCladExtendLabel(wall){
   const ce = wall.cladExtend; if (!ce) return '';
   const mirror = wall.face === 'int';
-  const ex = ce[wall.face || 'ext'] || {}, parts = [];
+  const ex = ce[wall.face || 'ext'] || {}, parts = [], rec = [];
   if (ex.left > 0) parts.push('+' + mm(ex.left) + ' mm ' + (mirror ? 'dir.' : 'esq.'));
   if (ex.right > 0) parts.push('+' + mm(ex.right) + ' mm ' + (mirror ? 'esq.' : 'dir.'));
-  return parts.length ? 'continuidade ' + parts.join(' / ') : '';
+  if (ex.left < 0) rec.push(mm(-ex.left) + ' mm ' + (mirror ? 'dir.' : 'esq.'));
+  if (ex.right < 0) rec.push(mm(-ex.right) + ' mm ' + (mirror ? 'esq.' : 'dir.'));
+  const out = []; if (parts.length) out.push('continuidade ' + parts.join(' / ')); if (rec.length) out.push('recuo (sem revestimento) ' + rec.join(' / ') + ' + montante extra na borda');
+  return out.join(' · ');
 }
 function migrateWallMont(st){
   (st.walls || []).forEach(w => { if (w.montOverride == null) w.montOverride = false; });
@@ -1322,9 +1387,9 @@ function toast(msg){ const t = $('#toast'); t.textContent = msg; t.classList.add
 /* =====================================================================
    PAINEL DE ENTRADA
    ===================================================================== */
-function lenField(label, mmVal, attrs, unitKey){
+function lenField(label, mmVal, attrs, unitKey, imode){   // imode: 'text' nos campos que aceitam valor NEGATIVO (o teclado numérico do celular não tem o sinal de menos)
   const u = unitKey === 'mm' ? 'mm' : S.unit;
-  return `<label class="f"><span>${label}</span><div class="inp"><input type="text" inputmode="decimal" autocomplete="off" ${attrs} data-u="${unitKey || 'g'}" value="${esc(toDisp(mmVal, u))}"><em>${u}</em></div></label>`;
+  return `<label class="f"><span>${label}</span><div class="inp"><input type="text" inputmode="${imode || 'decimal'}" autocomplete="off" ${attrs} data-u="${unitKey || 'g'}" value="${esc(toDisp(mmVal, u))}"><em>${u}</em></div></label>`;
 }
 function staggerOptions(P){   // com montantes, o desencontro é sempre múltiplo da modulação
   const M = P.studs, mt = curMat(), maxD = mt ? Math.max(mt.w, mt.h) : 2400, o = [];
@@ -1555,14 +1620,15 @@ function wallCladExtendFields(w){
   // A ordem dos dois campos na tela segue o lado VISTO (esquerda primeiro, direita depois), igual ao desenho:
   // na Face Interna isso inverte a ordem dos campos (o que grava em .right vem primeiro, rotulado "à esquerda").
   const faceBlock = (key, label, mirror) => {
-    const fLeft = lenField('Continuidade à ' + (mirror ? 'direita' : 'esquerda') + ' — ' + label, CE[key].left || 0, `data-wext="${key}.left"`, 'mm');
-    const fRight = lenField('Continuidade à ' + (mirror ? 'esquerda' : 'direita') + ' — ' + label, CE[key].right || 0, `data-wext="${key}.right"`, 'mm');
+    const fLeft = lenField('Continuidade à ' + (mirror ? 'direita' : 'esquerda') + ' — ' + label + ' (− = recuo)', CE[key].left || 0, `data-wext="${key}.left"`, 'mm', 'text');
+    const fRight = lenField('Continuidade à ' + (mirror ? 'esquerda' : 'direita') + ' — ' + label + ' (− = recuo)', CE[key].right || 0, `data-wext="${key}.right"`, 'mm', 'text');
     return `
     <div class="grid2" style="margin-top:10px">
       ${mirror ? fRight + fLeft : fLeft + fRight}
     </div>${mirror ? '<p class="hint" style="margin:4px 0 0">Esquerda/direita aqui já consideram a vista espelhada da Face Interna — de pé, de frente para esta face.</p>' : ''}`;
   };
-  return faceBlock('ext', 'Face Externa', false) + (w.twoFaces ? faceBlock('int', 'Face Interna', true) : '');
+  return faceBlock('ext', 'Face Externa', false) + (w.twoFaces ? faceBlock('int', 'Face Interna', true) : '') +
+    '<p class="hint" style="margin:6px 0 0">Valor <b>positivo</b> = continuidade (a chapa avança além do último montante). Valor <b>negativo</b> = <b>recuo</b>: o revestimento termina antes do fim da parede, exatamente onde o valor cair (sem ajustar ao montante mais próximo) — adicione um montante nessa borda; o app já o marca na vista da parede.</p>';
 }
 function opRow(o){
   return `<div class="op-row" data-opid="${o.id}">
@@ -1732,7 +1798,8 @@ function resultsBlock(layer){
   const montOverrideWalls = r.entries.filter(e => e.wall.montOverride && e.wall.mont).map(e => e.wall.name);
   const montLine = montOverrideWalls.length ? `<br>Montagem própria (diferente do padrão do projeto) em: <b>${Array.from(new Set(montOverrideWalls)).join(', ')}</b> — veja os detalhes na tabela "Paredes" do relatório.` : '';
   const cladExtWalls = r.entries.filter(e => wallCladExtendLabel(e.wall)).map(e => `${e.wall.name} (${wallCladExtendLabel(e.wall)})`);
-  const cladExtLine = cladExtWalls.length ? `<br>Continuidade de revestimento ativa em: <b>${cladExtWalls.join('; ')}</b>.` : '';
+  const anyRecuo = r.entries.some(e => { const c = wallRecuo(e.wall, P); return c.l > 0 || c.r > 0; });
+  const cladExtLine = cladExtWalls.length ? `<br>${anyRecuo ? 'Continuidade / recuo de revestimento ativo em' : 'Continuidade de revestimento ativa em'}: <b>${cladExtWalls.join('; ')}</b>.${anyRecuo ? ' No recuo o revestimento termina exatamente onde o valor cai: adicione um montante nessa borda (marcado na vista da parede).' : ''}` : '';
   // amarração entre Face Externa e Face Interna (juntas verticais desencontradas, tipo tijolinho) -- usa o
   // mesmo valor "desencontro mínimo das juntas" cadastrado por parede (wall.stagger), reaproveitado a
   // pedido do Carlos; só existe em paredes "duas faces" com esse campo > 0.
@@ -1746,7 +1813,7 @@ function resultsBlock(layer){
   return `
   <div class="kpis">
     ${kpi('Chapas necessárias', m.nSheets, m.nSheets === 1 ? 'chapa' : 'chapas', `${m.nWholeClean} inteira${m.nWholeClean === 1 ? '' : 's'} sem corte · ${m.nSheets - m.nWholeClean} a cortar`, 'main')}
-    ${kpi('Área da parede', fmtNum(m.gross / 1e6, 2), 'm²', m.openArea > 0 ? `a revestir: ${fmtA(m.net)}` : 'sem aberturas')}
+    ${kpi('Área da parede', fmtNum(m.gross / 1e6, 2), 'm²', (m.openArea > 0 || m.uncovered > 0) ? `a revestir: ${fmtA(m.net)}` : 'sem aberturas')}
     ${kpi('Aproveitamento', fmtNum(m.util, 1), '%', 'área útil ÷ área das chapas')}
     ${kpi('Desperdício', fmtNum(m.wastePct, 1), '%', 'sobra ÷ área das chapas')}
     ${kpi('Área de sobra', fmtNum(m.waste / 1e6, 2), 'm²', `reaproveitável ${fmtA(m.reusableArea)}`)}
@@ -1871,7 +1938,9 @@ function renderWall(entry, r, opts){
   // acompanhar, com a faixa extra marcada visualmente (tracejada, cor de destaque) pra ficar claro que é
   // uma continuidade além da parede nominal, não um erro de desenho.
   const ceFace = (wall.cladExtend && wall.cladExtend[wall.face || 'ext']) || { left: 0, right: 0 };
-  const extL = ceFace.left || 0, extR = ceFace.right || 0;
+  // valor POSITIVO = continuidade (a tela cresce); NEGATIVO = recuo: zona SEM revestimento dentro da parede
+  const extL = Math.max(0, ceFace.left || 0), extR = Math.max(0, ceFace.right || 0);
+  const recu = wallRecuo(wall), recL = recu.l, recR = recu.r;
   const big = Math.max(W + extL + extR, H), mg = big * 0.075, fs = big / 55;
   // Cota dos montantes + rótulo de "sobra da modulação" (lado) precisam de espaço reservado ABAIXO da
   // parede, além da margem genérica "mg" -- sem isso esse texto cai bem na borda do viewBox e é cortado
@@ -1881,14 +1950,34 @@ function renderWall(entry, r, opts){
   const showStudRow = !!(wM.showStuds && wM.studs > 0 && !opts.noStuds);
   const studAxesArr = showStudRow ? studAxes(W, wM.studs, wSt) : [];
   const studLeftovers = showStudRow ? studLeftover(W, wM.studs, wSt) : [];
-  const studRowGap = mg * 0.42, studRowH = fs * 1.9, leftoverRowH = studLeftovers.length ? fs * 1.7 : 0;
-  const mgBot = showStudRow ? mg + studRowGap + studRowH + leftoverRowH : mg;
+  // Montante EXTRA na borda de cada recuo: a borda fica exatamente onde o recuo cai (sem ajustar ao montante
+  // mais próximo da grade); quem monta a parede adiciona um montante ali -- aqui só é marcado/cotado.
+  const extraSt = [];
+  if (recL > 0 && !studAxesArr.some(a => Math.abs(a - recL) < 0.5)) extraSt.push(recL);
+  if (recR > 0 && !studAxesArr.some(a => Math.abs(a - (W - recR)) < 0.5)) extraSt.push(W - recR);
+  const studRowGap = mg * 0.42, studRowH = fs * 1.9, extraRowH = showStudRow && extraSt.length ? fs * 0.9 : 0, leftoverRowH = studLeftovers.length ? fs * 1.7 : 0;
+  const mgBot = showStudRow ? mg + studRowGap + studRowH + extraRowH + leftoverRowH : mg;
   let geo = `<rect x="0" y="0" width="${W}" height="${H}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${fs * 0.1}"/>`;
   let texts = '';
   if (extL > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extL)} mm à ${mirror ? 'direita' : 'esquerda'}</title><rect x="${-extL}" y="0" width="${extL}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
   if (extR > 0) geo += `<g><title>Continuidade de revestimento: +${mm(extR)} mm à ${mirror ? 'esquerda' : 'direita'}</title><rect x="${W}" y="0" width="${extR}" height="${H}" fill="var(--accent)" opacity=".08" stroke="var(--accent)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
   if (extL > 0) texts += `<text x="${mx(-extL / 2)}" y="${H / 2}" text-anchor="middle" font-size="${fs * 0.75}" font-weight="700" fill="var(--accent)" opacity=".9">continuidade +${mm(extL)} mm</text>`;
   if (extR > 0) texts += `<text x="${mx(W + extR / 2)}" y="${H / 2}" text-anchor="middle" font-size="${fs * 0.75}" font-weight="700" fill="var(--accent)" opacity=".9">continuidade +${mm(extR)} mm</text>`;
+  [[0, recL], [W - recR, recR]].forEach(([zx, zw]) => {
+    if (!(zw > 0)) return;
+    geo += `<g><title>Sem revestimento: recuo de ${mm(zw)} mm — o revestimento termina antes do fim da parede (montante extra na borda)</title><rect x="${zx}" y="0" width="${zw}" height="${H}" fill="url(#hatchN)" stroke="var(--muted)" stroke-width="${fs * 0.08}" stroke-dasharray="${fs * 0.5} ${fs * 0.35}"/></g>`;
+    // rótulo (gira 90°): texto completo, ou só "sem revestimento" se não houver espaço livre sem encostar em abertura; no centro da altura se der
+    const zcx = zx + zw / 2, zfull = `sem revestimento — recuo ${mm(zw)} mm`;
+    const zopts = [zfull, 'sem revestimento'].map(t => { const f = Math.min(fs * 0.75, H * 0.92 / (t.length * 0.6)); return { t, f, hl: t.length * f * 0.58 / 2 }; });
+    let zpick = null;
+    for (const z of zopts){
+      const cy = [0.5, 0.2, 0.8, 0.35, 0.65, 0.1, 0.9].map(f => Math.max(z.hl, Math.min(H - z.hl, H * f)))
+        .find(c => !wall.openings.some(o => o.x < zcx + z.f && o.x + o.w > zcx - z.f && o.y < (H - c) + z.hl && o.y + o.h > (H - c) - z.hl));   // (o desenho tem y de cima pra baixo; a abertura, de baixo pra cima)
+      if (cy !== undefined){ zpick = Object.assign({ cy }, z); break; }
+    }
+    if (!zpick) zpick = Object.assign({ cy: H / 2 }, zopts[0]);
+    texts += `<text transform="translate(${mx(zcx)} ${zpick.cy}) rotate(-90)" text-anchor="middle" dominant-baseline="central" font-size="${zpick.f}" font-weight="700" fill="var(--muted)" stroke="var(--panel)" stroke-width="${zpick.f * 0.3}" paint-order="stroke">${zpick.t}</text>`;
+  });
   lay.pieces.forEach(p => {
     const rects = pieceRects(p), fill = p.whole ? 'var(--whole)' : 'var(--cut)', lb = biggestRect(rects), tag = shapeTag(p.shape);
     geo += `<g><title>Chapa ${p.label}${p.whole ? ' (inteira)' : ' (peça cortada' + (p.shapeDesc ? ' · ' + p.shapeDesc : '') + ')'} · ${mm(p.w)} × ${mm(p.h)} mm</title>`;
@@ -1923,15 +2012,17 @@ function renderWall(entry, r, opts){
     const dyM = H + studRowGap, tick = fs * 0.35;
     geo += `<g stroke="var(--muted)" stroke-width="${fs * 0.06}" fill="var(--muted)">
       <line x1="0" y1="${dyM}" x2="${W}" y2="${dyM}"/>
-      ${[0].concat(axes, [W]).map(x => `<line x1="${x}" y1="${dyM - tick}" x2="${x}" y2="${dyM + tick}"/>`).join('')}
+      ${[0].concat(axes, extraSt, [W]).map(x => `<line x1="${x}" y1="${dyM - tick}" x2="${x}" y2="${dyM + tick}"/>`).join('')}
     </g>`;
     axes.forEach(x => { const d = wSt === 'right' ? W - x : x; texts += `<text x="${mx(x)}" y="${dyM + fs * 1.3}" text-anchor="middle" font-size="${fs * 0.6}" fill="var(--muted)">${fmtLen(d)}</text>`; });
+    extraSt.forEach(x => { const d = wSt === 'right' ? W - x : x; texts += `<text x="${mx(x)}" y="${dyM + fs * 2.2}" text-anchor="middle" font-size="${fs * 0.6}" font-weight="700" fill="var(--accent)">montante extra ${fmtLen(d)}</text>`; });
     studLeftovers.forEach(lv => {
       geo += `<rect x="${lv.from}" y="0" width="${lv.to - lv.from}" height="${H}" fill="var(--warn)" opacity=".1"/>`;
       const lx = mx((lv.from + lv.to) / 2), side = mirror ? (lv.side === 'esquerda' ? 'direita' : 'esquerda') : lv.side;
-      texts += `<text x="${lx}" y="${dyM + studRowH + fs * 1.1}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)">sobra da modulação: ${mm(lv.size)} mm (lado ${side})</text>`;
+      texts += `<text x="${lx}" y="${dyM + studRowH + extraRowH + fs * 1.1}" text-anchor="middle" font-size="${fs * 0.65}" font-weight="700" fill="var(--warn)">sobra da modulação: ${mm(lv.size)} mm (lado ${side})</text>`;
     });
   }
+  extraSt.forEach(x => { geo += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="var(--stud)" stroke-width="${fs * 0.16}" opacity=".95"><title>Montante extra na borda do revestimento (fim do recuo)</title></line>`; });
   if (S.params.isClad){   // juntas do OSB (referência): o revestimento não pode alinhar com elas
     const av = avoidFor(S.params, wall.id);
     if (av){
@@ -1961,7 +2052,7 @@ function renderWall(entry, r, opts){
   // do lado que a extensão REALMENTE vai aparecer na tela, não do lado do referencial real.
   const vbExtL = mirror ? extR : extL, vbExtR = mirror ? extL : extR;
   return `<svg class="wallsvg" viewBox="${-vbExtL - mg} ${-mg} ${W + vbExtL + vbExtR + 2 * mg} ${H + mg + mgBot}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Paginação da parede ${esc(wall.name)}" ${opts.noStyle ? '' : `style="width:${UI.zoom * 100}%"`} font-family="Barlow,Segoe UI,Arial,sans-serif">
-    <defs><pattern id="hatchW" width="${fs * 0.9}" height="${fs * 0.9}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="${fs * 0.9}" height="${fs * 0.9}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 0.9}" stroke="var(--accent)" stroke-width="${fs * 0.1}"/></pattern></defs>
+    <defs><pattern id="hatchW" width="${fs * 0.9}" height="${fs * 0.9}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="${fs * 0.9}" height="${fs * 0.9}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 0.9}" stroke="var(--accent)" stroke-width="${fs * 0.1}"/></pattern>${recL > 0 || recR > 0 ? `<pattern id="hatchN" width="${fs * 1.1}" height="${fs * 1.1}" patternUnits="userSpaceOnUse" patternTransform="rotate(-45)"><rect width="${fs * 1.1}" height="${fs * 1.1}" fill="var(--panel)"/><line x1="0" y1="0" x2="0" y2="${fs * 1.1}" stroke="var(--muted)" stroke-width="${fs * 0.07}" opacity=".55"/></pattern>` : ''}</defs>
     ${body}${texts}${outer}${mirror ? `<text x="${W / 2}" y="${-mg * 0.85}" text-anchor="middle" font-size="${fs * 0.85}" font-weight="700" fill="var(--accent)">VISTA ESPELHADA — de frente para a Face Interna</text>` : ''}</svg>`;
 }
 /* renderSheetCuttingPlan: plano de corte de uma chapa */
@@ -2110,6 +2201,7 @@ function paneRes(){
   return `<div class="two">
     <div><h3 style="margin-bottom:6px">Balanço de áreas</h3><table class="bal"><tbody>
       <tr><td>Área da parede (bruta)</td><td class="n">${fmtA(m.gross)}</td></tr>
+      ${m.uncovered > 0 ? `<tr class="sub"><td>− Zona sem revestimento (recuo)</td><td class="n">${fmtA(m.uncovered)}</td></tr>` : ''}
       <tr class="sub"><td>− Aberturas</td><td class="n">${fmtA(m.openArea)}</td></tr>
       <tr class="sub"><td>= Área a revestir</td><td class="n">${fmtA(m.net)}</td></tr>
       <tr class="sub"><td>− Folga do piso (${mm(S.params.floorGap || 0)} mm)</td><td class="n">${fmtA(m.floorArea)}</td></tr>
@@ -2486,7 +2578,7 @@ function generateReport(){
     <h1>${esc(S.name)}</h1><div class="meta">Relatório de paginação de chapas${P.isClad ? ' — REVESTIMENTO sobre o OSB' : ''} · ${date}</div>
     <h2>Dados do projeto</h2>
     <table><thead><tr><th>Parede</th><th class="n">Dimensões</th><th class="n">Área bruta</th><th class="n">Aberturas</th><th class="n">Área a revestir</th><th class="n">Montagem</th><th class="n">Desenc. mín. juntas</th><th class="n">Sobra da modulação</th></tr></thead><tbody>
-      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(calculateWallArea(e.wall) - openingsArea(e.wall))}</td><td class="n">${esc(wallMontLabel(e.wall, P))}${wallCladExtendLabel(e.wall) ? '<br>' + esc(wallCladExtendLabel(e.wall)) : ''}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`).join('')}</tbody></table>
+      ${r.entries.map(e => `<tr><td>${esc(e.wall.name)}</td><td class="n">${fmtDim(e.wall.w, e.wall.h)}</td><td class="n">${fmtA(calculateWallArea(e.wall))}</td><td class="n">${e.wall.openings.length ? e.wall.openings.map(o => esc(o.name) + ' ' + mm(o.w) + '×' + mm(o.h) + (o.margin > 0 ? ' (recuo ' + mm(o.margin) + ' mm)' : '')).join('; ') : '-'}</td><td class="n">${fmtA(wallNetArea(e.wall))}</td><td class="n">${esc(wallMontLabel(e.wall, P))}${wallCladExtendLabel(e.wall) ? '<br>' + esc(wallCladExtendLabel(e.wall)) : ''}</td><td class="n">${e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '—'}</td><td class="n">${leftoverLabel(e.wall, r)}</td></tr>`).join('')}</tbody></table>
     <h2>Material e montagem</h2>
     <table><tbody>
       <tr><td>Chapa</td><td>${esc(R.mat.name)} (${esc(R.mat.type)}) · ${mm(R.mat.w)} × ${mm(R.mat.h)} mm · espessura ${fmtNum(R.mat.t, 1)} mm</td></tr>
@@ -2498,6 +2590,7 @@ function generateReport(){
       <tr><td>Chapas necessárias</td><td class="n"><b>${m.nSheets}</b> (${m.nWholeClean} inteiras sem corte, ${m.nSheets - m.nWholeClean} a cortar)</td><td>Área comprada</td><td class="n">${fmtA(m.nominal)}</td></tr>
       <tr><td>Área da parede (bruta)</td><td class="n">${fmtA(m.gross)}</td><td>Área utilizada (peças)</td><td class="n">${fmtA(m.pieceArea)}</td></tr>
       <tr><td>Área de aberturas</td><td class="n">${fmtA(m.openArea)}</td><td>Sobra total</td><td class="n">${fmtA(m.waste)}</td></tr>
+      ${m.uncovered > 0 ? `<tr><td>Zona sem revestimento (recuo)</td><td class="n">${fmtA(m.uncovered)}</td><td></td><td></td></tr>` : ''}
       <tr><td>Área revestida (líquida)</td><td class="n">${fmtA(m.net)}</td><td>Sobra reaproveitável / resíduo</td><td class="n">${fmtA(m.reusableArea)} / ${fmtA(m.residueArea)}</td></tr>
       <tr><td>Aproveitamento (útil ÷ comprada)</td><td class="n"><b>${fmtP(m.util)}</b></td><td>Desperdício</td><td class="n"><b>${fmtP(m.wastePct)}</b></td></tr>
       <tr><td>Parede bruta ÷ comprada</td><td class="n">${fmtP(m.wallOverNominal)}</td><td>Cortes</td><td class="n">${m.cuts}</td></tr></tbody></table>
@@ -2820,7 +2913,9 @@ function gcodeProgram(headerLines, strokes, P){
     const pl = pts[pts.length - 1];
     L.push(N() + 'G00X' + gcNum(pl.x) + 'Y' + gcNum(pl.y) + 'Z' + gcNum(P.cncSafeZ));
   };
-  headerLines.forEach(h => L.push(h));
+  // Rede de proteção: comentário G-code "(...)" NÃO é aninhado -- o controlador fecha no PRIMEIRO ")" e tenta executar o resto
+  // da linha como comando (o programa carrega, mas não roda). Qualquer "(" ou ")" que escape pro meio do texto vira "-".
+  headerLines.forEach(h => { const t = String(h); L.push(t.startsWith('(') && t.endsWith(')') ? '(' + t.slice(1, -1).replace(/[()]/g, '-') + ')' : t); });
   L.push(N() + 'G00G21G17G90G40G49G80');
   L.push(N() + 'T' + tool + 'M06');
   L.push(N() + 'G00G43Z' + gcNum(P.cncHomeZ) + 'H' + tool);
@@ -2995,7 +3090,7 @@ function generateGcode(sheet, r){
   ]).concat(!sheet.cutLines.length && trimmed ? [
     '(   CHAPA INTEIRA: este programa so faz o REFILO - nao ha corte de peca; depois do refilo a chapa ja e a peca)'
   ] : []).concat(strokes.some(s => s.phase === 'engrave') ? [
-    '(   ANTES DO CORTE: grava o nome de cada peca - altura ate ' + fmtNum(P.cncEngraveHeight, 0) + 'mm (reduz sozinha nas pecas pequenas, minimo ' + fmtNum(engraveMinHeight(), 0) + 'mm), prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com a chapa ainda inteira)'
+    '(   ANTES DO CORTE: grava o nome de cada peca - altura ate ' + fmtNum(P.cncEngraveHeight, 0) + 'mm, reduz sozinha nas pecas pequenas ate o minimo de ' + fmtNum(engraveMinHeight(), 0) + 'mm - prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com a chapa ainda inteira)'
   ] : []).concat(engraveHeaderLines([sheet], r));
   return gcodeProgram(header, strokes, P);
 }
@@ -3047,7 +3142,7 @@ function generatePieceGcode(sheet, r, pieceLabel){
     '(   ORIGEM X0 Y0 = CANTO INFERIOR ESQUERDO DA REGIAO DE CORTE DESTA PECA - menor X e menor Y dos cortes)',
     '(   USE UMA SOBRA/RETALHO de pelo menos ' + mm(pdw) + ' x ' + mm(pdh) + ' mm, alinhando o canto marcado no desenho com o zero da maquina.)'
   ].concat(strokes.some(s => s.phase === 'engrave') ? [
-    '(   ANTES DO CORTE: grava "' + gcText(pieceLabel) + '" na peca - altura ' + fmtNum(egInfo.H || P.cncEngraveHeight, egInfo.status === 'reduced' ? 1 : 0) + 'mm' + (egInfo.status === 'reduced' ? ' (reduzida para caber - configurada ' + fmtNum(P.cncEngraveHeight, 0) + 'mm)' : '') + ', prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com o material ainda inteiro)'
+    '(   ANTES DO CORTE: grava "' + gcText(pieceLabel) + '" na peca - altura ' + fmtNum(egInfo.H || P.cncEngraveHeight, egInfo.status === 'reduced' ? 1 : 0) + 'mm' + (egInfo.status === 'reduced' ? ' - reduzida para caber, configurada ' + fmtNum(P.cncEngraveHeight, 0) + 'mm' : '') + ', prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com o material ainda inteiro)'
   ] : (P.cncEngrave && egInfo.status === 'skipped' ? [
     '(   SEM GRAVACAO - a peca e pequena demais, nao cabe nem na altura minima de ' + fmtNum(engraveMinHeight(), 0) + 'mm)'
   ] : []));
@@ -3447,7 +3542,8 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
   const W = ent.wall.w, H = ent.wall.h;
   // Continuidade de revestimento (ver renderWall): a caixa cresce pro lado certo pra caber a extensão.
   const ceFace = (ent.wall.cladExtend && ent.wall.cladExtend[ent.wall.face || 'ext']) || { left: 0, right: 0 };
-  const extL = ceFace.left || 0, extR = ceFace.right || 0;
+  const extL = Math.max(0, ceFace.left || 0), extR = Math.max(0, ceFace.right || 0);
+  const recu = wallRecuo(ent.wall), recL = recu.l, recR = recu.r;      // recuo (valor negativo): zona sem revestimento dentro da parede
   const mirror = ent.wall.face === 'int';
   const vbExtL = mirror ? extR : extL, vbExtR = mirror ? extL : extR;   // lado em que a extensão aparece NA PÁGINA, depois do espelho
   const k = Math.min((boxW - 14) / (W + vbExtL + vbExtR), (boxH - 8) / H), ox = x + 12 + vbExtL * k, oy = y + 4;
@@ -3462,6 +3558,21 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
   if (extR > 0){ doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.25); doc.setLineDashPattern([1.4, 1], 0); doc.rect(mX(W, extR), oy, extR * k, H * k, 'D'); doc.setLineDashPattern([], 0);
     doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(6.5); doc.text('+' + mm(extR) + ' mm', mX(W + extR / 2, 0), oy + H * k / 2, { align: 'center' }); }
   doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.3); doc.setFillColor(255, 255, 255); doc.rect(ox, oy, W * k, H * k, 'FD');
+  const zoneLbls = [];
+  [[0, recL], [W - recR, recR]].forEach(([zx, zw]) => {
+    if (!(zw > 0)) return;
+    doc.setFillColor(228, 233, 235); doc.setDrawColor(...PDFC.mut); doc.setLineWidth(0.25); doc.setLineDashPattern([1.4, 1], 0); doc.rect(mX(zx, zw), oy, zw * k, H * k, 'FD'); doc.setLineDashPattern([], 0);
+    // rótulo (gira 90°): escolhe o texto e a altura onde NÃO encosta em nenhuma abertura; é desenhado depois das aberturas (por cima)
+    const zcx = zx + zw / 2;
+    const zopts = ['SEM REVESTIMENTO - recuo ' + mm(zw) + ' mm', 'SEM REVESTIMENTO'].map(t => { const f = Math.min(6.5, H * k * 0.92 / (t.length * 0.55 * 0.3528)); return { t, f, hl: t.length * f * 0.3528 * 0.55 / k / 2, hw: f * 0.3528 / k }; });   // 1 pt = 0,3528 mm (hl/hw em mm da parede)
+    let zpick = null;
+    for (const z of zopts){
+      const cy = [0.5, 0.2, 0.8, 0.35, 0.65, 0.1, 0.9].map(fr => Math.max(z.hl, Math.min(H - z.hl, H * fr)))
+        .find(c => !ent.wall.openings.some(o => o.x < zcx + z.hw && o.x + o.w > zcx - z.hw && o.y < c + z.hl && o.y + o.h > c - z.hl));
+      if (cy !== undefined){ zpick = Object.assign({ cy, cx: zcx }, z); break; }
+    }
+    zoneLbls.push(zpick || Object.assign({ cy: H / 2, cx: zcx }, zopts[0]));
+  });
   ent.lay.pieces.forEach(p => {
     const rs = pieceRects(p);
     doc.setFillColor(...(p.whole ? PDFC.whole : PDFC.cut)); doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.15);
@@ -3477,6 +3588,12 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.15); doc.setLineDashPattern([1.2, 1], 0);
     pdfAxes.forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k)); doc.setLineDashPattern([], 0);
   }
+  // montante EXTRA na borda do recuo (traço cheio, mais grosso que os montantes da grade)
+  const pdfExtra = [];
+  if (recL > 0 && !pdfAxes.some(a => Math.abs(a - recL) < 0.5)) pdfExtra.push(recL);
+  if (recR > 0 && !pdfAxes.some(a => Math.abs(a - (W - recR)) < 0.5)) pdfExtra.push(W - recR);
+  doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.4); doc.setLineDashPattern([], 0);
+  pdfExtra.forEach(sx => doc.line(mX(sx, 0), oy, mX(sx, 0), oy + H * k));
   if (S.params.isClad){
     const av = avoidFor(S.params, ent.wall.id);
     if (av){
@@ -3507,6 +3624,10 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
     doc.setDrawColor(...PDFC.acc); doc.setLineWidth(0.4); doc.setLineDashPattern([2, 1], 0); doc.setFillColor(255, 255, 255); doc.rect(px, py, o.w * k, o.h * k, 'FD'); doc.setLineDashPattern([], 0);
     doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.text(String(o.name), mC(o.x + o.w / 2), py + o.h * k / 2, { align: 'center' });
   });
+  zoneLbls.forEach(z => {
+    doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'bold'); doc.setFontSize(z.f);
+    doc.text(z.t, mC(z.cx) + z.f * 0.3528 * 0.35, oy + (H - z.cy) * k + z.t.length * z.f * 0.3528 * 0.55 / 2, { align: 'left', angle: 90 });
+  });
   doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.setFontSize(7.5);
   doc.text(mm(W) + ' mm', ox + W * k / 2, oy - 1, { align: 'center' });
   doc.text(mm(H) + ' mm', ox - 2, oy + H * k / 2, { align: 'center', angle: 90 });
@@ -3518,6 +3639,11 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
     doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.setFontSize(5.5);
     pdfAxes.forEach(sx => { const d = wSt === 'right' ? W - sx : sx; doc.text(fmtLen(d), mC(sx), belowY + 4, { align: 'center' }); });
     belowY += 5;
+    if (pdfExtra.length){
+      doc.setTextColor(...PDFC.acc); doc.setFont('helvetica', 'bold'); doc.setFontSize(5.5);
+      pdfExtra.forEach(sx => { const d = wSt === 'right' ? W - sx : sx; doc.text('montante extra ' + fmtLen(d), mC(sx), belowY + 4, { align: 'center' }); });
+      belowY += 5;
+    }
     if (pdfLeftovers.length){
       doc.setTextColor(200, 120, 0); doc.setFont('helvetica', 'bold'); doc.setFontSize(5.5);
       pdfLeftovers.forEach(lv => { const side = mirror ? (lv.side === 'esquerda' ? 'direita' : 'esquerda') : lv.side; doc.text('sobra ' + mm(lv.size) + ' mm (' + side + ')', mC((lv.from + lv.to) / 2), belowY + 4, { align: 'center' }); });
@@ -3683,7 +3809,7 @@ function buildPDF(){
   h2('Balanço de áreas');
   kv([['Área da parede (bruta)', fmtA(m.gross), 'Área comprada', fmtA(m.nominal)], ['Aberturas', fmtA(m.openArea), 'Área utilizada (peças)', fmtA(m.pieceArea)], ['Área a revestir', fmtA(m.net), 'Sobra total', fmtA(m.waste)],
     ['Folga do piso + juntas', fmtA(m.floorArea + m.jointArea), 'Sobra reaproveitável', fmtA(m.reusableArea)], ['Recuo ao redor das aberturas', fmtA(m.marginArea), 'Resíduo', fmtA(m.residueArea)],
-    ['Aproveitamento (útil/comprada)', fmtP(m.util), 'Desperdício', fmtP(m.wastePct)], ['Parede bruta / comprada', fmtP(m.wallOverNominal), '', '']], [0, 52, 96, 140]);
+    ['Aproveitamento (útil/comprada)', fmtP(m.util), 'Desperdício', fmtP(m.wastePct)], ['Parede bruta / comprada', fmtP(m.wallOverNominal), '', '']].concat(m.uncovered > 0 ? [['Zona sem revestimento (recuo)', fmtA(m.uncovered), '', '']] : []), [0, 52, 96, 140]);
   h2('Paredes');
   table([{ t: 'Parede', w: 28 }, { t: 'Dimensões (mm)', w: 28, a: 'r' }, { t: 'Área bruta', w: 22, a: 'r' }, { t: 'Aberturas', w: 20, a: 'r' }, { t: 'Inteiras', w: 14, a: 'r' }, { t: 'Cortadas', w: 16, a: 'r' }, { t: 'Montagem', w: 18, a: 'r' }, { t: 'Desenc. juntas', w: 18, a: 'r' }, { t: 'Sobra modulação', w: 22, a: 'r' }],
     r.entries.map(e => [e.wall.name, mm(e.wall.w) + ' x ' + mm(e.wall.h), fmtA(calculateWallArea(e.wall)), fmtA(openingsArea(e.wall)), e.lay.pieces.filter(p => p.whole).length, e.lay.pieces.filter(p => !p.whole).length, (e.wall.montOverride && e.wall.mont ? 'própria' : 'projeto') + (wallCladExtendLabel(e.wall) ? ' / ' + wallCladExtendLabel(e.wall) : ''), e.wall.stagger > 0 ? mm(e.wall.stagger) + ' mm' : '-', leftoverLabel(e.wall, r)]));
