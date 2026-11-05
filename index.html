@@ -1283,7 +1283,7 @@ function defaultState(){
   return { id: null, name: 'Novo projeto', unit: 'mm', walls: [w], activeWall: w.id, materialId: 'm-apaplus',
     params: { orientation: 'auto', start: 'left', studs: 0, studsCustom: false, gapV: 3, gapH: 3, floorGap: 10, cornerClear: 200, kerf: 4, tol: 0, minRem: 300, rotate: false, share: true, showStuds: true,
       cncMachine: 'RHINO 3000S', cncPost: 'ABSOLUTE 3000 ATC (mm) (*.tap)', cncTool: 1, cncToolName: 'Topo raso 4mm', cncRpm: 18000, cncFeed: 3000, cncPlunge: 300, cncPasses: 2, cncOvercut: 1, cncSafeZ: 20, cncHomeZ: 20.32, cncTableX: 1900, cncTableY: 2800,
-      cncEngrave: true, cncEngraveDepth: 1, cncEngraveFeed: 2500, cncEngraveHeight: 60 },
+      cncEngrave: true, cncEngraveDepth: 1, cncEngraveFeed: 2500, cncEngraveHeight: 60, cncEngraveMin: 15 },
     clad: defaultClad() };
 }
 function lsGet(k, d){ try { const v = localStorage.getItem(NS + k); return v ? JSON.parse(v) : d; } catch (e){ return d; } }
@@ -1433,10 +1433,11 @@ function renderInputs(){
       <label class="check"><input type="checkbox" data-p="cncEngrave" ${P.cncEngrave ? 'checked' : ''}> Gravar o nome da peça (ex.: "CHAPA 4.1") em cada peça, com profundidade rasa, antes de cortar</label>
       ${P.cncEngrave ? `<div class="grid3" style="margin-top:10px">
         <label class="f"><span>Altura da gravação</span><div class="inp"><input type="text" inputmode="numeric" data-p="cncEngraveHeight" value="${P.cncEngraveHeight || ''}"><em>mm</em></div></label>
+        <label class="f"><span>Altura mínima (ao reduzir)</span><div class="inp"><input type="text" inputmode="numeric" data-p="cncEngraveMin" value="${P.cncEngraveMin > 0 ? P.cncEngraveMin : ENGRAVE_MIN_H}"><em>mm</em></div></label>
         ${lenField('Profundidade da gravação', P.cncEngraveDepth, 'data-p="cncEngraveDepth"', 'mm')}
         <label class="f"><span>Avanço de gravação</span><div class="inp"><input type="text" inputmode="numeric" data-p="cncEngraveFeed" value="${P.cncEngraveFeed || ''}"><em>mm/min</em></div></label>
       </div>
-      <p class="hint">Gravação em traço único (estilo Arial, sem preencher), só com letras maiúsculas e sem acento, sempre na altura informada — se não couber na peça com essa altura, a gravação dessa peça é pulada (o tamanho não é reduzido automaticamente). Em peças estreitas e compridas, o texto gira 90°. Dentro de cada letra a fresa não sobe — só sobe entre uma letra e outra. A gravação sai sempre antes dos cortes, no mesmo programa.</p>` : ''}
+      <p class="hint">Gravação em traço único (estilo Arial, sem preencher), só com letras maiúsculas e sem acento, na altura informada. Se não couber na peça com essa altura, ela é <b>reduzida automaticamente</b> até caber (nunca abaixo da altura mínima, que evita letras "fechadas" pela fresa); só se nem na altura mínima couber é que a gravação daquela peça é pulada — o programa e a tela avisam quais peças foram reduzidas ou ficaram sem gravação. Em peças estreitas e compridas, o texto gira 90°. Dentro de cada letra a fresa não sobe — só sobe entre uma letra e outra. A gravação sai sempre antes dos cortes, no mesmo programa.</p>` : ''}
     </details>
   </div>
   <div class="card">
@@ -1627,7 +1628,7 @@ document.addEventListener('change', e => {
     else if (k === 'cncMachine' || k === 'cncPost' || k === 'cncToolName') P[k] = t.value;
     else if (k === 'cncTool'){ const v = Math.round(Number(t.value)); if (isFinite(v) && v >= 1) P.cncTool = v; t.value = P.cncTool; }
     else if (k === 'cncPasses'){ const v = Math.round(Number(t.value)); if (isFinite(v) && v >= 1) P.cncPasses = v; t.value = P.cncPasses; }
-    else if (['cncRpm', 'cncFeed', 'cncPlunge', 'cncOvercut', 'cncSafeZ', 'cncHomeZ', 'cncTableX', 'cncTableY', 'cncEngraveDepth', 'cncEngraveFeed', 'cncEngraveHeight'].includes(k)){
+    else if (['cncRpm', 'cncFeed', 'cncPlunge', 'cncOvercut', 'cncSafeZ', 'cncHomeZ', 'cncTableX', 'cncTableY', 'cncEngraveDepth', 'cncEngraveFeed', 'cncEngraveHeight', 'cncEngraveMin'].includes(k)){
       // parâmetros da máquina CNC: sempre em mm/rpm/mm-min, não seguem a unidade de exibição (mm/cm/m) do projeto
       const v = Number(String(t.value).replace(',', '.'));
       t.parentElement.classList.toggle('bad', !isFinite(v) || v < 0);
@@ -1800,6 +1801,57 @@ function biggestRect(rs){ return rs.reduce((a, b) => (b.w * b.h > a.w * a.h ? b 
    Carlos). A única forma de manter tudo consistente é espelhar TUDO junto (como sempre foi) ou não
    espelhar NADA -- não existe meio-termo só para o recorte. Revertido para o espelho completo (mx/mC). */
 function shapeTag(sh){ return sh === 'L' ? 'em L' : sh === 'U' ? 'em U' : sh === 'moldura' ? 'moldura' : sh ? 'c/ recortes' : ''; }
+/* Código da peça (ex.: "3.2") em TODA peça -- pedido do Carlos: "todas as peças que serão cortadas possuem
+   seu código/numeração. Quando a peça é pequena e é menor no desenho da vista e na chapa de corte ela fica
+   em branco. Preciso da marcação em ambos os lugares. Em peças menores, reduzir a escrita para caber."
+   Antes, o código só era escrito se a peça passasse de um tamanho mínimo fixo; tiras estreitas e recortes
+   pequenos ficavam sem número. Agora, quando o texto "de sempre" não cabe:
+     1) fitPieceCode() procura, em cada retângulo da peça, a posição que dá o MAIOR corpo de letra entre
+        maxS e minS: horizontal ou GIRADA 90° ao longo do lado maior (tira estreita e alta -> texto em pé);
+     2) se nem no corpo mínimo couber (peça minúscula), devolve fits:false e quem desenha põe o código num
+        SELO branco com borda, centrado na peça, mesmo que o selo ultrapasse a peça -- nunca fica sem marca.
+   w1/h1 = largura/altura do texto por unidade de corpo; as unidades de rects e de maxS/minS são as de quem
+   desenha (mm da parede no SVG, mm da página no PDF). Nada muda para a peça em que o texto já cabia. */
+function fitPieceCode(rects, maxS, minS, w1, h1){
+  let best = null;
+  rects.forEach(r => [false, true].forEach(rot => {
+    const along = rot ? r.h : r.w, across = rot ? r.w : r.h;
+    const s = Math.min(maxS, along * 0.92 / w1, across * 0.8 / h1);
+    const score = rot ? s / 1.15 : s;           // prefere o texto na horizontal, salvo se girar render >15% maior
+    if (s > 0 && (!best || score > best.score)) best = { r, rot, s, score };
+  }));
+  if (best && best.s >= minS) return { fits: true, cx: best.r.x + best.r.w / 2, cy: best.r.y + best.r.h / 2, rot: best.rot, s: best.s };
+  const r = biggestRect(rects);
+  return { fits: false, cx: r.x + r.w / 2, cy: r.y + r.h / 2, rot: r.h > r.w, s: minS };
+}
+// Largura estimada (em "em") do código em negrito: dígitos ~0,58, ponto ~0,3, o resto ~0,64.
+function codeEm(text){ return String(text).split('').reduce((a, ch) => a + (/\d/.test(ch) ? 0.58 : ch === '.' ? 0.3 : 0.64), 0); }
+// Código da peça em SVG: texto simples quando cabe (reto ou girado), ou selo branco quando é peça minúscula.
+// cx/cy já na posição de tela (no SVG da Face Interna o chamador passa o X já espelhado).
+function svgPieceCode(text, fit, badgeS){
+  const t = esc(String(text)), cx = fit.cx, cy = fit.cy, tr = fit.rot ? ` transform="rotate(-90 ${cx} ${cy})"` : '';
+  if (fit.fits) return `<text x="${cx}" y="${cy}"${tr} text-anchor="middle" dominant-baseline="middle" font-size="${fit.s}" font-weight="700" fill="var(--ink)" stroke="var(--panel)" stroke-width="${fit.s * 0.06}" paint-order="stroke">${t}</text>`;
+  const bw = codeEm(text) * badgeS + badgeS * 0.6, bh = badgeS * 1.25;
+  return `<g${tr}><rect x="${cx - bw / 2}" y="${cy - bh / 2}" width="${bw}" height="${bh}" rx="${badgeS * 0.2}" fill="var(--panel)" stroke="var(--ink)" stroke-width="${badgeS * 0.07}"/>
+    <text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="middle" font-size="${badgeS}" font-weight="700" fill="var(--ink)">${t}</text></g>`;
+}
+// Mesma ideia no PDF (unidades em mm da página; o corpo da letra em pt). doc deve estar com helvetica bold.
+function pdfPieceFit(doc, text, rects, maxPt, minPt){
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(10);
+  const w1 = doc.getTextWidth(String(text)) / 10;         // mm por pt de corpo
+  return Object.assign(fitPieceCode(rects, maxPt, minPt, w1, 0.3528 * 0.78), { w1 });
+}
+function pdfPieceCode(doc, text, fit, badgePt){
+  const T = String(text), pt = fit.fits ? fit.s : badgePt, cap = pt * 0.3528 * 0.72, tw = fit.w1 * pt;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(pt); doc.setTextColor(...PDFC.ink);
+  if (!fit.fits){
+    const bw = tw + 1.4, bh = pt * 0.3528 * 1.3 + 0.6, w = fit.rot ? bh : bw, h = fit.rot ? bw : bh;
+    doc.setFillColor(255, 255, 255); doc.setDrawColor(...PDFC.ink); doc.setLineWidth(0.15);
+    doc.roundedRect(fit.cx - w / 2, fit.cy - h / 2, w, h, 0.4, 0.4, 'FD');
+  }
+  if (fit.rot) doc.text(T, fit.cx + cap / 2, fit.cy + tw / 2, { angle: 90 });
+  else doc.text(T, fit.cx, fit.cy + cap / 2, { align: 'center' });
+}
 /* renderWall: vista da parede, proporcional às medidas reais */
 function renderWall(entry, r, opts){
   opts = opts || {};
@@ -1846,7 +1898,13 @@ function renderWall(entry, r, opts){
     } else geo += `<rect x="${p.x}" y="${H - (p.y + p.h)}" width="${p.w}" height="${p.h}" fill="${fill}" stroke="var(--ink)" stroke-width="${fs * 0.07}"/>`;
     geo += '</g>';
     const cx = mx(lb.x + lb.w / 2), cy = H - (lb.y + lb.h) + lb.h / 2, l1 = 'Chapa ' + p.label, l2 = mm(p.w) + ' × ' + mm(p.h), l3 = p.whole ? 'inteira' : (tag ? 'cortada ' + tag : 'cortada');
-    if (lb.w > fs * 2 && lb.h > fs * 1.4){
+    const smallW = !fsFit(l1, fs, lb.w) ? fs * 0.7 : fs, shownW = lb.w < fs * 5 ? String(p.label) : l1;
+    if (!(lb.w > fs * 2 && lb.h > fs * 1.4 && fsFit(shownW, smallW, lb.w))){
+      // Peça pequena/estreita: o texto "de sempre" não cabe (antes ficava em branco ou estourava a peça) --
+      // código com corpo reduzido, girado ao longo do lado maior se for tira, ou em selo se minúscula.
+      const fit = fitPieceCode(rects, fs, fs * 0.28, codeEm(p.label), 0.78);
+      texts += svgPieceCode(p.label, Object.assign({}, fit, { cx: mx(fit.cx), cy: H - fit.cy }), fs * 0.5);
+    } else if (lb.w > fs * 2 && lb.h > fs * 1.4){
       const small = !fsFit(l1, fs, lb.w) ? fs * 0.7 : fs;
       texts += `<text x="${cx}" y="${cy - (lb.h > fs * 4 ? fs * 0.7 : 0)}" text-anchor="middle" dominant-baseline="middle" font-size="${small}" font-weight="700" fill="var(--ink)" stroke="var(--panel)" stroke-width="${fs * 0.02}">${l1.replace('Chapa ', lb.w < fs * 5 ? '' : 'Chapa ')}</text>`;
       if (lb.h > fs * 4 && lb.w > fs * 4) texts += `<text x="${cx}" y="${cy + fs * 0.6}" text-anchor="middle" dominant-baseline="middle" font-size="${fsFit(l2, fs * 0.85, lb.w) ? fs * 0.85 : fs * 0.6}" fill="var(--ink)">${l2}</text>`;
@@ -1960,7 +2018,12 @@ function renderSheetCuttingPlan(sheet, r){
       s += `<path d="${mergeCutSegs(unionOutline(body), 0.01).map(c => { const [x1, y1] = spt(c.x1, c.y1), [x2, y2] = spt(c.x2, c.y2); return `M${x1} ${y1}L${x2} ${y2}`; }).join('')}" fill="none" stroke="var(--ink)" stroke-width="${fs * 0.08}"/>`;
     } else s += `<rect x="${dbb.x}" y="${dbb.y}" width="${dbb.w}" height="${dbb.h}" fill="${fill}" stroke="var(--ink)" stroke-width="${fs * 0.08}"/>`;
     const lbn = biggestRect(body), d = srect(lbn.x, lbn.y, lbn.w, lbn.h);
-    if (d.w > fs * 3 && d.h > fs * 2.2){
+    if (!whole && !(d.w > fs * 3 && d.h > fs * 2.2 && fsFit(String(p.label), fs * 0.95, d.w))){
+      // Peça pequena/estreita na chapa: código com corpo reduzido, girado (tira) ou em selo (minúscula) --
+      // sempre aparece, igual na Vista da parede.
+      const fit = fitPieceCode(body.map(b => srect(b.x, b.y, b.w, b.h)), fs * 0.95, fs * 0.28, codeEm(p.label), 0.78);
+      s += svgPieceCode(p.label, fit, fs * 0.55);
+    } else if (d.w > fs * 3 && d.h > fs * 2.2){
       const cx = d.x + d.w / 2, cy = d.y + d.h / 2;
       s += `<text x="${cx}" y="${cy - fs * 0.9}" text-anchor="middle" dominant-baseline="middle" font-size="${fs * 0.95}" font-weight="700" fill="var(--ink)">${whole ? 'Chapa inteira' : esc(p.label)}</text>
         <text x="${cx}" y="${cy + fs * 0.1}" text-anchor="middle" dominant-baseline="middle" font-size="${fsFit(l2, fs * 0.9, d.w) ? fs * 0.9 : fs * 0.6}" fill="var(--ink)">${l2}${pl.rot ? ' ↻' : ''}${tag ? ' · ' + tag : ''}</text>
@@ -1985,12 +2048,12 @@ function paneWall(){
 }
 function wallMetrics(ent){ return { whole: ent.lay.pieces.filter(p => p.whole).length, cut: ent.lay.pieces.filter(p => !p.whole).length }; }
 function panePlan(){
-  const r = R.sel.r, anyCuts = r.sheets.some(s => s.cutLines.length);
+  const r = R.sel.r, anyCuts = r.sheets.some(s => sheetHasProgram(s, r, R.mat));
   return `<div class="toolbar" style="margin:0 0 10px">
       <p class="hint" style="margin:0">Cada chapa mostra as peças (verde-água), as sobras reaproveitáveis (verde), os resíduos (cinza) e os cortes em vermelho tracejado. O número da peça é o mesmo usado na vista da parede (chapa.peça).</p>
       <button class="btn ghost sm" style="margin-left:auto;white-space:nowrap" data-act3="gcodeall" data-layer="${CUR_LAYER}" ${anyCuts ? '' : 'disabled'}>⬇ Baixar tudo (.zip)</button>
     </div>
-  ${S.params.cncEngrave ? engraveInstallNote() : ''}
+  ${S.params.cncEngrave ? engraveInstallNote() + engraveSummaryNote(r) : ''}
   <div class="sheet-grid">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>${legend()}`;
 }
 // Regra de instalação da face gravada: por pedido do Carlos, a face gravada deve ficar voltada para o
@@ -2001,6 +2064,20 @@ function panePlan(){
 function engraveInstallNote(){
   return `<div class="note info" style="margin:0 0 10px">📌 <b>Regra de instalação:</b> monte sempre com a face GRAVADA (a que aparece nestes desenhos) voltada para o lado visível — fachada, no revestimento externo, ou ambiente, no interno. A face sem gravação fica encostada no montante.</div>`;
 }
+// Avisos da gravação automática (peças com letra reduzida / sem gravação) -- na tela e no relatório.
+function engraveSummaryNote(r){
+  const rep = engraveReport(r.sheets, r); let h = '';
+  const lst = (arr, f) => arr.slice(0, 30).map(f).join(', ') + (arr.length > 30 ? ' … e mais ' + (arr.length - 30) : '');
+  if (rep.reduced.length) h += `<div class="note info" style="margin:0 0 10px">✍ <b>Gravação reduzida para caber:</b> ${rep.reduced.length} peça${rep.reduced.length === 1 ? '' : 's'} (${lst(rep.reduced, x => esc(x.label) + ' · ' + mm(x.H) + ' mm')}). A altura configurada (${mm(S.params.cncEngraveHeight)} mm) não cabia nelas.</div>`;
+  if (rep.skipped.length) h += `<div class="note warn" style="margin:0 0 10px">⚠ <b>Sem gravação:</b> ${lst(rep.skipped, x => esc(x.label))} — nem na altura mínima de ${mm(engraveMinHeight())} mm cabe. Reduza a altura mínima em "Programa de usinagem CNC" ou marque essas peças à mão.</div>`;
+  return h;
+}
+function engraveCardNote(s, r){
+  const rep = engraveReport([s], r); let h = '';
+  if (rep.reduced.length) h += `<p class="hint" style="margin:0 0 6px">✍ Gravação reduzida para caber: ${rep.reduced.map(x => esc(x.label) + ' (' + mm(x.H) + ' mm)').join(', ')}.</p>`;
+  if (rep.skipped.length) h += `<p class="hint" style="margin:0 0 6px;color:var(--warn)"><b>⚠ Sem gravação</b> (nem na altura mínima de ${mm(engraveMinHeight())} mm): ${rep.skipped.map(x => esc(x.label)).join(', ')}.</p>`;
+  return h;
+}
 function sheetCard(s, r){
   const used = s.placed.reduce((a, p) => a + plArea(p), 0), tot = r.sw * r.sh, { W, H, mdim } = sheetAxes(r);
   const opts = s.kind === 'cut' && s.placed.length > 1
@@ -2009,7 +2086,8 @@ function sheetCard(s, r){
   return `<div class="sheet-card"><h3>Chapa ${s.no} · ${s.kind === 'whole' && !s.trimmed ? 'inteira' : s.kind === 'whole' ? 'inteira (com ajuste)' : 'cortada'}</h3>
     <p>${mm(W)} × ${mm(H)} mm · aproveitamento ${fmtP(used / tot * 100)} · ${s.cuts} corte${s.cuts === 1 ? '' : 's'}</p>
     ${renderSheetCuttingPlan(s, r)}
-    ${s.cutLines.length ? `<div class="gcode-btn" style="margin-top:8px">${opts ? `<div class="inp" style="margin-bottom:6px"><select data-gcpiece="${s.no}">${opts}</select></div>` : ''}<button class="btn ghost sm" style="width:100%" data-act3="gcode" data-sheet="${s.no}" data-layer="${CUR_LAYER}">Baixar programa de usinagem</button><button class="btn ghost sm" style="width:100%;margin-top:6px" data-act3="sim" data-sheet="${s.no}" data-layer="${CUR_LAYER}">▶ Simular usinagem</button></div>` : '<p class="hint" style="margin:8px 0 0">Sem cortes — usar a chapa inteira, sem programar a máquina.</p>'}</div>`;
+    ${engraveCardNote(s, r)}
+    ${sheetHasProgram(s, r, R.mat) ? `<div class="gcode-btn" style="margin-top:8px">${sheetTrimOnly(s, r, R.mat) ? `<p class="hint" style="margin:0 0 6px">Chapa inteira de material refilado: o programa refila a chapa bruta de ${mm(sheetTrim(r, R.mat).rawW)} × ${mm(sheetTrim(r, R.mat).rawH)} mm até ${mm(W)} × ${mm(H)} mm na própria CNC (sem corte de peça).</p>` : ''}${opts ? `<div class="inp" style="margin-bottom:6px"><select data-gcpiece="${s.no}">${opts}</select></div>` : ''}<button class="btn ghost sm" style="width:100%" data-act3="gcode" data-sheet="${s.no}" data-layer="${CUR_LAYER}">${sheetTrimOnly(s, r, R.mat) ? 'Baixar programa de refilo' : 'Baixar programa de usinagem'}</button><button class="btn ghost sm" style="width:100%;margin-top:6px" data-act3="sim" data-sheet="${s.no}" data-layer="${CUR_LAYER}">▶ Simular usinagem</button></div>` : '<p class="hint" style="margin:8px 0 0">Sem cortes — usar a chapa inteira, sem programar a máquina.</p>'}</div>`;
 }
 function paneList(){
   const r = R.sel.r, m = r.metrics, cl = calculateCuts(r), { mdim } = sheetAxes(r);
@@ -2022,7 +2100,7 @@ function paneList(){
     <p class="hint">Largura e altura são da caixa da peça, como instalada na parede. Peças em L, U ou com furo (moldura) contornam o vão inteiras — sem junta nos cantos da abertura; o recorte indicado é o vão a retirar.</p>` : '<p class="empty">Nenhuma peça precisa de corte: só chapas inteiras.</p>'}
     <h3 style="margin:18px 0 6px">Corte chapa por chapa</h3>
     <div class="tbl-wrap"><table><thead><tr><th>Chapa</th><th>Peças (largura × altura, mm)</th><th class="n">Cortes</th></tr></thead><tbody>
-      ${r.sheets.map(s => `<tr><td><b>${s.no}</b> ${s.kind === 'whole' && !s.trimmed ? '· inteira' : ''}</td><td style="white-space:normal">${s.kind === 'whole' && !s.trimmed ? 'Usar inteira, sem corte' : s.placed.map(pl => { const [dw, dh] = mdim(pl.w, pl.h); return `<b>${esc(pl.piece.label)}</b> ${mm(dw)}×${mm(dh)}${pl.rot ? ' (girada)' : ''}`; }).join(' &nbsp;·&nbsp; ')}</td><td class="n">${s.cuts}</td></tr>`).join('')}</tbody></table></div>
+      ${r.sheets.map(s => `<tr><td><b>${s.no}</b> ${s.kind === 'whole' && !s.trimmed ? '· inteira' : ''}</td><td style="white-space:normal">${s.kind === 'whole' && !s.trimmed ? wholeSheetNote(s, r, 'Usar inteira, sem corte') : s.placed.map(pl => { const [dw, dh] = mdim(pl.w, pl.h); return `<b>${esc(pl.piece.label)}</b> ${mm(dw)}×${mm(dh)}${pl.rot ? ' (girada)' : ''}`; }).join(' &nbsp;·&nbsp; ')}</td><td class="n">${s.cuts}</td></tr>`).join('')}</tbody></table></div>
     <p class="hint">As medidas já descontam a junta entre chapas. A serra (${mm(S.params.kerf)} mm) foi considerada entre as peças de cada chapa.</p>`;
 }
 function paneRes(){
@@ -2429,9 +2507,9 @@ function generateReport(){
     ${cl.length ? `<table><thead><tr><th class="n">Qtd</th><th class="n">Largura</th><th class="n">Altura</th><th>Formato</th><th>Chapa(s)</th><th>Parede(s)</th></tr></thead><tbody>${cl.map(g => `<tr><td class="n">${g.qty}</td><td class="n">${mm(g.w)}</td><td class="n">${mm(g.h)}</td><td style="white-space:normal">${g.shape ? esc(g.shape) : 'Retangular'}</td><td>${Array.from(g.sheets).sort((a, b) => a - b).join(', ')}</td><td>${Array.from(g.walls).map(esc).join(', ')}</td></tr>`).join('')}</tbody></table>` : '<p>Somente chapas inteiras.</p>'}
     <p>Chapas inteiras sem corte: <b>${m.nWholeClean}</b> (${mm(r.sw)} × ${mm(r.sh)} mm).</p>
     <h2>Corte chapa por chapa</h2>
-    <table><thead><tr><th>Chapa</th><th>Peças</th><th class="n">Cortes</th></tr></thead><tbody>${r.sheets.map(s => `<tr><td>${s.no}</td><td style="white-space:normal">${s.kind === 'whole' && !s.trimmed ? 'Inteira, sem corte' : s.placed.map(pl => { const [dw, dh] = mdim(pl.w, pl.h); return esc(pl.piece.label) + ': ' + mm(dw) + '×' + mm(dh) + (pl.rot ? ' (girada)' : ''); }).join(' · ')}</td><td class="n">${s.cuts}</td></tr>`).join('')}</tbody></table>
+    <table><thead><tr><th>Chapa</th><th>Peças</th><th class="n">Cortes</th></tr></thead><tbody>${r.sheets.map(s => `<tr><td>${s.no}</td><td style="white-space:normal">${s.kind === 'whole' && !s.trimmed ? wholeSheetNote(s, r, 'Inteira, sem corte') : s.placed.map(pl => { const [dw, dh] = mdim(pl.w, pl.h); return esc(pl.piece.label) + ': ' + mm(dw) + '×' + mm(dh) + (pl.rot ? ' (girada)' : ''); }).join(' · ')}</td><td class="n">${s.cuts}</td></tr>`).join('')}</tbody></table>
     <h2>Planos de corte</h2>
-    ${P.cncEngrave ? engraveInstallNote() : ''}
+    ${P.cncEngrave ? engraveInstallNote() + engraveSummaryNote(r) : ''}
     <div class="sheets">${r.sheets.map(s => sheetCard(s, r)).join('')}</div>
     <div class="footer-rights" style="margin-top:14px">Desenvolvido por Carlos Hoff - Todos os direitos reservados.</div>
   </div>`;
@@ -2536,10 +2614,11 @@ function glyphOrigins(text){
 }
 const ENGRAVE_MARGIN = 6;
 // Gera as polilinhas de gravação (em coordenadas LOCAIS da peça, mesmo espaço de sheet.cutLines/
-// pl.x,y,w,h — Y para cima) para gravar `text` centralizado na peça `pl`, numa altura FIXA de
-// `heightMM` (não reduz para caber — se não couber na peça com a margem, desiste e não grava nada
-// nela). Gira o texto 90° quando a peça é mais alta que larga (tira estreita), para acompanhar o lado
-// maior. Cada polilinha devolvida já é um traço contínuo (ver comentário da fonte acima).
+// pl.x,y,w,h — Y para cima) para gravar `text` centralizado na peça `pl`. A altura pedida é a ALTURA
+// CONFIGURADA (heightMM); quando ela não cabe na peça, a altura é REDUZIDA AUTOMATICAMENTE até a altura
+// mínima (P.cncEngraveMin) -- ver engraveInfo(). Gira o texto 90° quando a peça é mais alta que larga
+// (tira estreita), para acompanhar o lado maior. Cada polilinha devolvida já é um traço contínuo (ver
+// comentário da fonte acima).
 //
 // Numa peça com recorte (formato L/U/moldura, contornando uma abertura — ver pl.body/pl.voids em
 // placePiece), a caixa cheia (pl.x,y,w,h) inclui a área VAZIA do vão, que é removida/descartada — não
@@ -2552,17 +2631,45 @@ function engraveTargetRect(pl){
   if (!pl.body || !pl.body.length) return { x: pl.x, y: pl.y, w: pl.w, h: pl.h };
   return pl.body.reduce((best, r) => (!best || r.w * r.h > best.w * best.h) ? r : best, null);
 }
-function pieceEngraveCuts(pl, text, heightMM){
+/* Altura da gravação AUTOMÁTICA -- pedido do Carlos: "Reduzir automaticamente na programação para caber a
+   marcação." Antes, se a altura configurada (ex.: 60 mm) não coubesse na peça, a gravação daquela peça era
+   simplesmente PULADA (peça pequena/tira estreita ficava sem código na própria peça). Agora, em ordem:
+     'full'    cabe na altura configurada, margem de 6 mm, giro pela forma da peça -- idêntico ao de antes;
+     'reduced' não coube: reduz a altura até caber (testa as duas orientações; tenta primeiro com a margem de
+               sempre e, só se preciso, com margem apertada, ainda fora do rasgo da fresa), mas nunca abaixo
+               da altura MÍNIMA (P.cncEngraveMin, padrão 15 mm: a fresa tem ~4 mm de diâmetro e letras
+               menores que isso "fecham" -- vira mancha);
+     'skipped' nem na altura mínima cabe: não grava (o programa e a tela avisam quais peças ficaram sem).  */
+const ENGRAVE_MIN_H = 15;
+function engraveMinHeight(){ const v = S.params && S.params.cncEngraveMin; return v > 0 ? v : ENGRAVE_MIN_H; }
+function engraveInfo(pl, text, heightMM){
   const raw = normalizeEngraveText(text);
-  if (!raw) return [];
+  if (!raw) return { status: 'none' };
   const { origins, widthUnits } = glyphOrigins(raw);
-  if (!origins.length || widthUnits <= 0) return [];
-  const H = heightMM > 0 ? heightMM : 60;
-  const target = engraveTargetRect(pl);
-  const rotate = target.h > target.w;
-  const availW = (rotate ? target.h : target.w) - 2 * ENGRAVE_MARGIN, availH = (rotate ? target.w : target.h) - 2 * ENGRAVE_MARGIN;
-  const s = H / FONT_GRID_H;
-  if (availW <= 0 || availH <= 0 || H > availH || widthUnits * s > availW) return [];
+  if (!origins.length || widthUnits <= 0) return { status: 'none' };
+  const H0 = heightMM > 0 ? heightMM : 60, target = engraveTargetRect(pl), rot0 = target.h > target.w;
+  // maior altura de letra que cabe, dada a orientação e a margem: limitada pela largura da peça (através
+  // do texto) e pelo comprimento do texto (largura das letras proporcional à altura)
+  const maxH = (rot, m) => {
+    const along = (rot ? target.h : target.w) - 2 * m, across = (rot ? target.w : target.h) - 2 * m;
+    return along > 0 && across > 0 ? Math.min(across, along * FONT_GRID_H / widthUnits) : 0;
+  };
+  const base = { origins, widthUnits, target };
+  if (maxH(rot0, ENGRAVE_MARGIN) >= H0) return Object.assign({ status: 'full', H: H0, rotate: rot0, margin: ENGRAVE_MARGIN }, base);
+  const minH = Math.min(engraveMinHeight(), H0), kerf = (S.params && S.params.kerf) || 0, tight = Math.max(3, kerf / 2 + 1);
+  for (const m of [ENGRAVE_MARGIN, tight]){
+    const best = [rot0, !rot0].map(rot => ({ rot, h: maxH(rot, m) })).sort((x, y) => y.h - x.h)[0];
+    if (best.h >= minH){
+      let Hr = Math.min(H0, best.h); const r1 = Math.floor(Hr * 10) / 10; if (r1 >= minH) Hr = r1;
+      return Object.assign({ status: 'reduced', H: Hr, rotate: best.rot, margin: m }, base);
+    }
+  }
+  return { status: 'skipped', H: 0, minH };
+}
+function pieceEngraveCuts(pl, text, heightMM){
+  const info = engraveInfo(pl, text, heightMM);
+  if (info.status !== 'full' && info.status !== 'reduced') return [];
+  const { origins, widthUnits, target, rotate } = info, s = info.H / FONT_GRID_H;
   const startX = -(widthUnits * s) / 2, cx = target.x + target.w / 2, cy = target.y + target.h / 2, paths = [];
   origins.forEach(({ ch, x }) => {
     glyphStrokes(ch).forEach(stroke => {
@@ -2575,6 +2682,21 @@ function pieceEngraveCuts(pl, text, heightMM){
     });
   });
   return paths;
+}
+// Resumo da gravação de uma chapa (ou de várias): quais peças saíram com altura REDUZIDA e quais ficaram SEM
+// gravação. Só conta chapas que têm programa na CNC (chapa inteira sem programa não é gravada).
+function engraveReport(sheets, r){
+  const P = S.params, out = { reduced: [], skipped: [] };
+  if (!P.cncEngrave) return out;
+  sheets.forEach(sh => {
+    if (!sheetHasProgram(sh, r, R.mat)) return;
+    sh.placed.forEach(pl => {
+      const inf = engraveInfo(pl, pl.piece.label, P.cncEngraveHeight);
+      if (inf.status === 'reduced') out.reduced.push({ label: String(pl.piece.label), H: inf.H });
+      else if (inf.status === 'skipped') out.skipped.push({ label: String(pl.piece.label) });
+    });
+  });
+  return out;
 }
 
 /* ---------- refilo da chapa bruta (opcional, por material) ----------
@@ -2599,6 +2721,30 @@ function trimCutLines(usefulW, usefulH, rawW, rawH){
   if (usefulW < rawW - 0.05) cuts.push({ x1: usefulW, y1: 0, x2: usefulW, y2: rawH });
   if (usefulH < rawH - 0.05) cuts.push({ x1: 0, y1: usefulH, x2: rawW, y2: usefulH });
   return cuts;
+}
+/* Refilo desta chapa no referencial da MÁQUINA: { lines: corte(s) de refilo, rawW/rawH: medida bruta/física }.
+   Sem refilo no material (ou nada a remover), lines vem vazio e raw = útil. Usado pelo programa de
+   usinagem (sheetToolpath) e para decidir se a chapa precisa de programa mesmo sem corte de peça.
+   Pedido do Carlos: "em casos de chapas inteiras, induplac as quais são refiladas, tenha o programa para
+   refilar as mesmas na própria CNC" -- antes, chapa inteira sem corte de peça não gerava programa
+   nenhum (cutLines vazio), então o refilo da chapa bruta nunca saía, só quando havia corte junto. */
+function sheetTrim(r, mat){
+  const { T, W, H } = sheetAxes(r);
+  if (!(mat && (mat.trimW > 0 || mat.trimH > 0))) return { lines: [], rawW: W, rawH: H };
+  const raw = rawSheetDims(mat, r.orient);
+  const rawW = T ? raw.sh : raw.sw, rawH = T ? raw.sw : raw.sh;
+  return { lines: trimCutLines(W, H, rawW, rawH), rawW, rawH };
+}
+// A chapa precisa de programa na CNC quando tem corte de peça OU quando precisa de refilo (chapa inteira
+// de material refilado, p.ex. Induplac).
+function sheetHasProgram(sheet, r, mat){ return sheet.cutLines.length > 0 || sheetTrim(r, mat).lines.length > 0; }
+// Chapa inteira cujo único serviço na CNC é o refilo (nenhum corte de peça).
+function sheetTrimOnly(sheet, r, mat){ return sheet.cutLines.length === 0 && sheetTrim(r, mat).lines.length > 0; }
+// Texto da chapa inteira nas listas/relatórios: "sem corte" só quando realmente não passa pela CNC.
+function wholeSheetNote(sheet, r, plain){
+  if (!sheetTrimOnly(sheet, r, R.mat)) return plain;
+  const t = sheetTrim(r, R.mat), { W, H } = sheetAxes(r);
+  return plain.replace(/,? sem corte$/, '') + ' - só refilo na CNC (' + mm(t.rawW) + ' x ' + mm(t.rawH) + ' para ' + mm(W) + ' x ' + mm(H) + ' mm)';
 }
 
 /* ---------- programa de usinagem CNC (G-code, no dialeto do arquivo Corte_1 fornecido) ----------
@@ -2822,14 +2968,9 @@ function sheetToolpath(sheet, r){
   const step = total / passes, tool = Math.round(P.cncTool);
   const { T, W, H, mpt } = sheetAxes(r); // W,H = dimensão ÚTIL (a paginação já encaixa nela, ver solve())
   const ordered = orderCuts(sheet.cutLines, mpt);
-  const hasTrim = mat.trimW > 0 || mat.trimH > 0;
-  let allCuts = ordered, rawW = W, rawH = H, trimmed = false;
-  if (hasTrim){
-    const raw = rawSheetDims(mat, r.orient);
-    rawW = T ? raw.sh : raw.sw; rawH = T ? raw.sw : raw.sh;
-    const trimLines = trimCutLines(W, H, rawW, rawH);
-    if (trimLines.length){ allCuts = trimLines.concat(ordered); trimmed = true; }
-  }
+  let allCuts = ordered, trimmed = false;
+  const tr = sheetTrim(r, mat), rawW = tr.rawW, rawH = tr.rawH;
+  if (tr.lines.length){ allCuts = tr.lines.concat(ordered); trimmed = true; }
   let engrave = [];
   if (P.cncEngrave) sheet.placed.forEach(pl => { engrave = engrave.concat(orderPaths(pieceEngraveCuts(pl, pl.piece.label, P.cncEngraveHeight), mpt)); });
   const strokes = buildStrokes(allCuts, passes, step, P, engrave);
@@ -2851,10 +2992,21 @@ function generateGcode(sheet, r){
     '(   ORIGEM X0 Y0 = CANTO DE REFERENCIA DA CHAPA NA MESA - mesmo ponto marcado no desenho)',
     '(   ORDEM: corte inicia na base - Y menor - e avanca para o topo - Y maior)',
     '(   cada passe percorre TODOS os cortes na profundidade atual antes de aprofundar o proximo)'
-  ]).concat(strokes.some(s => s.phase === 'engrave') ? [
-    '(   ANTES DO CORTE: grava o nome de cada peca - altura ' + fmtNum(P.cncEngraveHeight, 0) + 'mm, prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com a chapa ainda inteira)'
-  ] : []);
+  ]).concat(!sheet.cutLines.length && trimmed ? [
+    '(   CHAPA INTEIRA: este programa so faz o REFILO - nao ha corte de peca; depois do refilo a chapa ja e a peca)'
+  ] : []).concat(strokes.some(s => s.phase === 'engrave') ? [
+    '(   ANTES DO CORTE: grava o nome de cada peca - altura ate ' + fmtNum(P.cncEngraveHeight, 0) + 'mm (reduz sozinha nas pecas pequenas, minimo ' + fmtNum(engraveMinHeight(), 0) + 'mm), prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com a chapa ainda inteira)'
+  ] : []).concat(engraveHeaderLines([sheet], r));
   return gcodeProgram(header, strokes, P);
+}
+// Linhas de cabeçalho do G-code sobre a gravação automática: quais peças saíram com a letra REDUZIDA e quais
+// ficaram SEM gravação (nem na altura mínima cabe). Vazio quando todas gravam na altura configurada.
+function engraveHeaderLines(sheets, r){
+  const rep = engraveReport(sheets, r), lines = [];
+  const list = (arr, f) => { const it = arr.map(f); return it.slice(0, 12).join(' ') + (it.length > 12 ? ' ... mais ' + (it.length - 12) : ''); };
+  if (rep.reduced.length) lines.push('(   GRAVACAO REDUZIDA PARA CABER NA PECA: ' + gcText(list(rep.reduced, x => x.label + '=' + fmtNum(x.H, 1) + 'mm')) + ')');
+  if (rep.skipped.length) lines.push('(   SEM GRAVACAO - nao cabe nem na altura minima de ' + fmtNum(engraveMinHeight(), 0) + 'mm: ' + gcText(list(rep.skipped, x => x.label)) + ')');
+  return lines;
 }
 // Mesma ideia de sheetToolpath, só que para UMA peça (sobra/retalho), já deslocada pro canto próprio.
 function pieceToolpath(sheet, r, pieceLabel){
@@ -2884,6 +3036,7 @@ function pieceToolpath(sheet, r, pieceLabel){
 function generatePieceGcode(sheet, r, pieceLabel){
   const tp = pieceToolpath(sheet, r, pieceLabel);
   const { P, mat, total, passes, tool, pdw, pdh, pl, strokes } = tp;
+  const egInfo = P.cncEngrave && pl ? engraveInfo(pl, pieceLabel, P.cncEngraveHeight) : { status: 'none' };
   const header = [
     '( ' + gcText(S.name || 'Projeto') + (P.isClad ? ' - REVESTIMENTO' : '') + ' - Chapa ' + sheet.no + ' - Peca ' + gcText(pieceLabel) + ' )',
     '(######## Troca de ferramentas ########)',
@@ -2894,15 +3047,17 @@ function generatePieceGcode(sheet, r, pieceLabel){
     '(   ORIGEM X0 Y0 = CANTO INFERIOR ESQUERDO DA REGIAO DE CORTE DESTA PECA - menor X e menor Y dos cortes)',
     '(   USE UMA SOBRA/RETALHO de pelo menos ' + mm(pdw) + ' x ' + mm(pdh) + ' mm, alinhando o canto marcado no desenho com o zero da maquina.)'
   ].concat(strokes.some(s => s.phase === 'engrave') ? [
-    '(   ANTES DO CORTE: grava "' + gcText(pieceLabel) + '" na peca - altura ' + fmtNum(P.cncEngraveHeight, 0) + 'mm, prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com o material ainda inteiro)'
-  ] : []);
+    '(   ANTES DO CORTE: grava "' + gcText(pieceLabel) + '" na peca - altura ' + fmtNum(egInfo.H || P.cncEngraveHeight, egInfo.status === 'reduced' ? 1 : 0) + 'mm' + (egInfo.status === 'reduced' ? ' (reduzida para caber - configurada ' + fmtNum(P.cncEngraveHeight, 0) + 'mm)' : '') + ', prof.' + fmtNum(P.cncEngraveDepth, 2) + 'mm, tracos continuos - com o material ainda inteiro)'
+  ] : (P.cncEngrave && egInfo.status === 'skipped' ? [
+    '(   SEM GRAVACAO - a peca e pequena demais, nao cabe nem na altura minima de ' + fmtNum(engraveMinHeight(), 0) + 'mm)'
+  ] : []));
   return gcodeProgram(header, strokes, P);
 }
 function exportGcode(sheetNo, pieceLabel, layer){ return inLayer(layer || 0, () => exportGcodeL(sheetNo, pieceLabel)); }
 function exportGcodeL(sheetNo, pieceLabel){
   if (!R){ toast('Corrija os dados antes de exportar.'); return; }
   const sheet = R.sel.r.sheets.find(s => s.no === sheetNo);
-  if (!sheet || !sheet.cutLines.length){ toast('Essa chapa não tem cortes a programar.'); return; }
+  if (!sheet || !sheetHasProgram(sheet, R.sel.r, R.mat)){ toast('Essa chapa não tem cortes nem refilo a programar.'); return; }
   const errs = validateCnc(S.params, R.mat);
   if (errs.length){ toast('Corrija em "Programa de usinagem CNC": ' + errs[0] + '.'); return; }
   if (pieceLabel){
@@ -2926,8 +3081,8 @@ function exportAllGcodeCollect(){
   if (!R){ toast('Corrija os dados antes de exportar.'); return null; }
   const errs = validateCnc(S.params, R.mat);
   if (errs.length){ toast('Corrija em "Programa de usinagem CNC": ' + errs[0] + '.'); return null; }
-  const sheets = R.sel.r.sheets.filter(s => s.cutLines.length);
-  if (!sheets.length){ toast('Nenhuma chapa tem corte a programar — só chapas inteiras, sem precisar programar a máquina.'); return null; }
+  const sheets = R.sel.r.sheets.filter(s => sheetHasProgram(s, R.sel.r, R.mat));   // corte de peça OU refilo (chapa inteira de material refilado)
+  if (!sheets.length){ toast('Nenhuma chapa tem corte ou refilo a programar — só chapas inteiras, sem precisar programar a máquina.'); return null; }
   if (!(window.jspdf && window.jspdf.jsPDF)){ toast('A biblioteca de PDF não carregou (sem internet?) — não foi possível montar o relatório para incluir no .zip.'); return null; }
   const folder = (S.name || 'projeto').replace(/[^\w\-]+/g, '_') + (CUR_LAYER ? '_revest' : '');
   const files = sheets.map(sheet => ({ name: folder + '_chapa' + sheet.no + '.txt', content: generateGcode(sheet, R.sel.r) }));
@@ -3211,7 +3366,7 @@ function openSim(sheetNo, pieceLabel, layer){
   return inLayer(layer || 0, () => {
     if (!R){ toast('Corrija os dados antes de simular.'); return; }
     const sheet = R.sel.r.sheets.find(s => s.no === sheetNo);
-    if (!sheet || !sheet.cutLines.length){ toast('Essa chapa não tem cortes a programar.'); return; }
+    if (!sheet || !sheetHasProgram(sheet, R.sel.r, R.mat)){ toast('Essa chapa não tem cortes nem refilo a programar.'); return; }
     const errs = validateCnc(S.params, R.mat);
     if (errs.length){ toast('Corrija em "Programa de usinagem CNC": ' + errs[0] + '.'); return; }
     const r = R.sel.r;
@@ -3334,8 +3489,16 @@ function pdfWall(doc, x, y, boxW, boxH, ent, r){
   ent.lay.pieces.forEach(p => {
     const lb = biggestRect(pieceRects(p)), pcx = mC(lb.x + lb.w / 2), py = oy + (H - lb.y - lb.h) * k, pw = lb.w * k, ph = lb.h * k;
     doc.setTextColor(...PDFC.ink);
-    if (pw > 9 && ph > 5){
-      doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(8, pw / 3.4 + 2)); doc.text(String(p.label) + (p.shape ? ' (' + shapeTag(p.shape) + ')' : ''), pcx, py + ph / 2 - (ph > 12 ? 1 : -1), { align: 'center' });
+    const wallTxt = String(p.label) + (p.shape ? ' (' + shapeTag(p.shape) + ')' : '');
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(8, pw / 3.4 + 2));
+    const wallTxtFits = pw > 9 && ph > 5 && doc.getTextWidth(wallTxt) <= pw * 0.98;
+    if (!wallTxtFits){
+      // Peça pequena/estreita: o texto "de sempre" não cabe -- código com corpo reduzido, girado (tira) ou
+      // em selo (minúscula), em qualquer lugar da peça (mesmo critério do plano de corte e da tela).
+      const rr = pieceRects(p).map(b => ({ x: mX(b.x, b.w), y: oy + (H - b.y - b.h) * k, w: b.w * k, h: b.h * k }));
+      pdfPieceCode(doc, p.label, pdfPieceFit(doc, p.label, rr, 8, 3), 4.2);
+    } else {
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(Math.min(8, pw / 3.4 + 2)); doc.text(wallTxt, pcx, py + ph / 2 - (ph > 12 ? 1 : -1), { align: 'center' });
       if (ph > 12 && pw > 16){ doc.setFont('helvetica', 'normal'); doc.setFontSize(Math.min(6.5, pw / 4 + 1.5)); doc.text(mm(p.w) + ' x ' + mm(p.h), pcx, py + ph / 2 + 3, { align: 'center' }); }
     }
   });
@@ -3383,7 +3546,14 @@ function pdfSheet(doc, x, y, boxW, boxH, s, r){
       mergeCutSegs(unionOutline(body), 0.01).forEach(c => { const [x1, y1] = spt(c.x1, c.y1), [x2, y2] = spt(c.x2, c.y2); doc.line(x + x1 * k, y + y1 * k, x + x2 * k, y + y2 * k); });
     } else doc.rect(x + dbb.x * k, y + dbb.y * k, dbb.w * k, dbb.h * k, 'FD');
     const lbn = biggestRect(body), d = srect(lbn.x, lbn.y, lbn.w, lbn.h), px = x + d.x * k, py = y + d.y * k, pw = d.w * k, ph = d.h * k;
-    if (pw > 12 && ph > 8){ doc.setTextColor(...PDFC.ink); doc.setFont('helvetica', 'bold'); doc.setFontSize(7); doc.text(s.kind === 'whole' && !s.trimmed ? 'Inteira' : String(pl.piece.label), px + pw / 2, py + ph / 2 - 1, { align: 'center' });
+    const sheetWhole = s.kind === 'whole' && !s.trimmed;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(7);
+    if (!sheetWhole && !(pw > 12 && ph > 8 && doc.getTextWidth(String(pl.piece.label)) <= pw * 0.95)){
+      // Peça pequena/estreita na chapa: código com corpo reduzido, girado (tira) ou em selo (minúscula) --
+      // sempre aparece (mesmo critério da vista da parede).
+      const rr = body.map(b => { const q = srect(b.x, b.y, b.w, b.h); return { x: x + q.x * k, y: y + q.y * k, w: q.w * k, h: q.h * k }; });
+      pdfPieceCode(doc, pl.piece.label, pdfPieceFit(doc, pl.piece.label, rr, 7, 3), 4.2);
+    } else if (pw > 12 && ph > 8){ doc.setTextColor(...PDFC.ink); doc.setFont('helvetica', 'bold'); doc.setFontSize(7); doc.text(sheetWhole ? 'Inteira' : String(pl.piece.label), px + pw / 2, py + ph / 2 - 1, { align: 'center' });
       doc.setFont('helvetica', 'normal'); doc.setFontSize(6.5); doc.text(mm(dbb.w) + ' x ' + mm(dbb.h) + (pl.rot ? ' (g)' : '') + (pl.piece.shape ? ' ' + shapeTag(pl.piece.shape) : ''), px + pw / 2, py + ph / 2 + 2.5, { align: 'center' }); }
   });
   doc.setDrawColor(...PDFC.red); doc.setLineWidth(0.3); doc.setLineDashPattern([1.5, 1], 0);
@@ -3533,7 +3703,7 @@ function buildPDF(){
   if (cl.length) table([{ t: 'Qtd', w: 12, a: 'r' }, { t: 'Largura', w: 20, a: 'r' }, { t: 'Altura', w: 20, a: 'r' }, { t: 'Formato', w: 78 }, { t: 'Chapa(s)', w: 28 }, { t: 'Parede(s)', w: 28 }], cl.map(g => [g.qty, mm(g.w), mm(g.h), g.shape || 'Retangular', Array.from(g.sheets).sort((a, b) => a - b).join(', '), Array.from(g.walls).join(', ')]));
   h2('Corte chapa por chapa');
   table([{ t: 'Chapa', w: 18 }, { t: 'Peças (largura x altura, mm)', w: 146 }, { t: 'Cortes', w: 22, a: 'r' }],
-    r.sheets.map(s => [s.no, s.kind === 'whole' && !s.trimmed ? 'Inteira, sem corte' : s.placed.map(pl => { const [dw, dh] = mdimPdf(pl.w, pl.h); return pl.piece.label + ': ' + mm(dw) + 'x' + mm(dh) + (pl.rot ? ' (girada)' : ''); }).join('   '), s.cuts]));
+    r.sheets.map(s => [s.no, s.kind === 'whole' && !s.trimmed ? wholeSheetNote(s, r, 'Inteira, sem corte') : s.placed.map(pl => { const [dw, dh] = mdimPdf(pl.w, pl.h); return pl.piece.label + ': ' + mm(dw) + 'x' + mm(dh) + (pl.rot ? ' (girada)' : ''); }).join('   '), s.cuts]));
   // planos de corte (3 por linha)
   newPage(); h2('Planos de corte por chapa'); doc.setFontSize(8); doc.setTextColor(...PDFC.mut); doc.setFont('helvetica', 'normal'); doc.text('Tracejado vermelho = corte. Numeração das peças: chapa.peça (igual à vista da parede).', M, y); y += 4.5;
   if (P.cncEngrave){
@@ -3541,6 +3711,16 @@ function buildPDF(){
     doc.setFont('helvetica', 'normal'); doc.setTextColor(...PDFC.mut);
     const noteLines = doc.splitTextToSize('Monte sempre com a face GRAVADA (a destes desenhos) voltada para o lado visível (fachada/ambiente, conforme a face) — a face sem gravação fica encostada no montante.', PW - 2 * M);
     need(noteLines.length * 3.6); doc.text(noteLines, M, y); y += noteLines.length * 3.6;
+    // gravação automática: peças com a letra reduzida / peças sem gravação (nem na altura mínima cabe)
+    const egAll = engraveReport(r.sheets, r), egList = a => a.slice(0, 30).join(', ') + (a.length > 30 ? ' ... e mais ' + (a.length - 30) : '');
+    if (egAll.reduced.length){
+      const t = doc.splitTextToSize('Gravação reduzida para caber na peça (' + egAll.reduced.length + '): ' + egList(egAll.reduced.map(x => x.label + ' ' + mm(x.H) + ' mm')) + '. A altura configurada era ' + mm(P.cncEngraveHeight) + ' mm.', PW - 2 * M);
+      need(t.length * 3.6); doc.setTextColor(...PDFC.mut); doc.text(t, M, y); y += t.length * 3.6;
+    }
+    if (egAll.skipped.length){
+      const t = doc.splitTextToSize('SEM gravação (nem na altura mínima de ' + mm(engraveMinHeight()) + ' mm cabe): ' + egList(egAll.skipped.map(x => x.label)) + '. Marcar essas peças à mão.', PW - 2 * M);
+      need(t.length * 3.6); doc.setFont('helvetica', 'bold'); doc.setTextColor(...PDFC.ink); doc.text(t, M, y); y += t.length * 3.6; doc.setFont('helvetica', 'normal');
+    }
   }
   y += 1.5;
   const cellW = (PW - 2 * M - 12) / 3, cellH = 96; let col = 0, rowTop = y;
